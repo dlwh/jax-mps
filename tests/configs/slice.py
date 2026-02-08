@@ -36,6 +36,13 @@ def make_slice_op_configs():
                 name="take-scalar-high-rank-axis1",
             ),
             OperationTestConfig(
+                lambda x, idx: jnp.take(x, idx, axis=3),
+                numpy.random.normal(size=(2, 3, 4, 7, 8)).astype(numpy.float32),
+                numpy.int32(2),
+                differentiable_argnums=(),
+                name="take-scalar-high-rank-axis3",
+            ),
+            OperationTestConfig(
                 lambda a, ix, iy: a[jnp.arange(a.shape[0]), ix, :, iy],
                 numpy.random.normal(size=(2, 4, 6, 5)).astype(numpy.float32),
                 numpy.array([0, 2], dtype=numpy.int32),
