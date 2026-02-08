@@ -19,6 +19,36 @@ Final training loss: 0.028
 Time per step (second half): 0.991
 ```
 
+## Performance Profiling
+
+Use the profiling script to quantify where `mps` is faster/slower than CPU and
+to estimate fusion-sensitive gaps:
+
+```bash
+uv run python scripts/profile_fusion_gap.py
+```
+
+The script prints:
+
+1. Matmul crossover sizes.
+2. Elementwise add/tanh throughput across tensor sizes.
+3. Fused-vs-stepwise pointwise-chain timings.
+4. Tiny dispatch overhead (`jit` call + sync in a loop).
+
+For graph-level fusion opportunity diagnostics while running normal workloads,
+set:
+
+```bash
+JAX_MPS_FUSION_DEBUG=1
+```
+
+This emits per-program stats from `mps_executable.mm`, including:
+
+1. Total op count.
+2. Pointwise-op count.
+3. Max pointwise chain length.
+4. Count of pointwise chains of length >= 4.
+
 ## Installation
 
 jax-mps requires macOS on Apple Silicon and Python 3.13. Install it with pip:

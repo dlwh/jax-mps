@@ -4,7 +4,13 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <sstream>
+#include <unordered_set>
 #include <unordered_map>
+#include <vector>
 
 #import "pjrt_plugin/issue_url.h"
 #import "pjrt_plugin/mps_buffer.h"
@@ -82,6 +88,104 @@ struct ProcessResult {
 static ProcessResult processOperations(MPSGraph* graph, mlir::Block& block, ValueMap& values,
                                        mlir::ModuleOp module, int depth);
 
+struct FusionOpportunityStats {
+    size_t total_ops = 0;
+    size_t pointwise_ops = 0;
+    size_t multi_result_ops = 0;
+    size_t max_pointwise_chain = 0;
+    size_t pointwise_chains_ge4 = 0;
+    std::unordered_map<std::string, size_t> op_counts;
+};
+
+static bool ShouldLogFusionStats() {
+    const char* env = std::getenv("JAX_MPS_FUSION_DEBUG");
+    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+static bool IsPointwiseCandidate(const std::string& op_name) {
+    static const std::unordered_set<std::string> kPointwiseOps = {
+        "stablehlo.abs",          "stablehlo.add",          "stablehlo.and",
+        "stablehlo.atan2",        "stablehlo.bitcast_convert", "stablehlo.broadcast_in_dim",
+        "stablehlo.ceil",         "stablehlo.clamp",        "stablehlo.compare",
+        "stablehlo.convert",      "stablehlo.cosine",       "stablehlo.divide",
+        "stablehlo.exponential",  "stablehlo.exponential_minus_one",
+        "stablehlo.floor",        "stablehlo.log",          "stablehlo.log1p",
+        "stablehlo.logistic",     "stablehlo.maximum",      "stablehlo.minimum",
+        "stablehlo.multiply",     "stablehlo.negate",       "stablehlo.not",
+        "stablehlo.or",           "stablehlo.power",        "stablehlo.real",
+        "stablehlo.reduce_precision", "stablehlo.remainder", "stablehlo.reshape",
+        "stablehlo.reverse",      "stablehlo.round_nearest_afz",
+        "stablehlo.round_nearest_even", "stablehlo.rsqrt", "stablehlo.select",
+        "stablehlo.shift_left",   "stablehlo.shift_right_arithmetic",
+        "stablehlo.shift_right_logical", "stablehlo.sign",  "stablehlo.sine",
+        "stablehlo.sqrt",         "stablehlo.subtract",     "stablehlo.tan",
+        "stablehlo.tanh",         "stablehlo.transpose",    "stablehlo.xor",
+        "chlo.top_k",
+    };
+    return kPointwiseOps.find(op_name) != kPointwiseOps.end();
+}
+
+static FusionOpportunityStats AnalyzeFusionOpportunities(mlir::Block& block) {
+    FusionOpportunityStats stats;
+    size_t current_chain = 0;
+
+    for (mlir::Operation& operation : block) {
+        mlir::Operation* op = &operation;
+        std::string op_name = op->getName().getStringRef().str();
+
+        // Exclude region control plumbing from the pointwise-chain metric.
+        if (mlir::isa<mlir::func::ReturnOp>(op) || mlir::isa<mlir::func::CallOp>(op)) {
+            stats.max_pointwise_chain = std::max(stats.max_pointwise_chain, current_chain);
+            if (current_chain >= 4) {
+                stats.pointwise_chains_ge4++;
+            }
+            current_chain = 0;
+            continue;
+        }
+
+        stats.total_ops++;
+        stats.op_counts[op_name]++;
+        if (op->getNumResults() > 1) {
+            stats.multi_result_ops++;
+        }
+
+        bool is_pointwise = op->getNumResults() == 1 && IsPointwiseCandidate(op_name);
+        if (is_pointwise) {
+            stats.pointwise_ops++;
+            current_chain++;
+            continue;
+        }
+
+        stats.max_pointwise_chain = std::max(stats.max_pointwise_chain, current_chain);
+        if (current_chain >= 4) {
+            stats.pointwise_chains_ge4++;
+        }
+        current_chain = 0;
+    }
+
+    stats.max_pointwise_chain = std::max(stats.max_pointwise_chain, current_chain);
+    if (current_chain >= 4) {
+        stats.pointwise_chains_ge4++;
+    }
+    return stats;
+}
+
+static std::string TopOpsSummary(const std::unordered_map<std::string, size_t>& counts, size_t k) {
+    std::vector<std::pair<std::string, size_t>> items(counts.begin(), counts.end());
+    std::sort(
+        items.begin(), items.end(),
+        [](const auto& lhs, const auto& rhs) { return lhs.second > rhs.second; });
+
+    std::ostringstream os;
+    for (size_t i = 0; i < items.size() && i < k; ++i) {
+        if (i > 0) {
+            os << ", ";
+        }
+        os << items[i].first << ":" << items[i].second;
+    }
+    return os.str();
+}
+
 // Process a func.call operation by looking up the callee and processing its body
 static ProcessResult processCallOp(MPSGraph* graph, mlir::func::CallOp callOp, ValueMap& values,
                                    mlir::ModuleOp module, int depth) {
@@ -140,6 +244,19 @@ static ProcessResult processCallOp(MPSGraph* graph, mlir::func::CallOp callOp, V
 static ProcessResult processOperations(MPSGraph* graph, mlir::Block& block, ValueMap& values,
                                        mlir::ModuleOp module, int depth) {
     ProcessResult result;
+
+    if (depth == 0 && ShouldLogFusionStats()) {
+        FusionOpportunityStats stats = AnalyzeFusionOpportunities(block);
+        if (stats.total_ops > 0) {
+            fprintf(stderr,
+                    "[JAX-MPS FUSION] total_ops=%zu pointwise_ops=%zu multi_result_ops=%zu "
+                    "max_pointwise_chain=%zu chains_ge4=%zu\n",
+                    stats.total_ops, stats.pointwise_ops, stats.multi_result_ops,
+                    stats.max_pointwise_chain, stats.pointwise_chains_ge4);
+            fprintf(stderr, "[JAX-MPS FUSION] top_ops=%s\n",
+                    TopOpsSummary(stats.op_counts, 8).c_str());
+        }
+    }
 
     for (mlir::Operation& operation : block) {
         mlir::Operation* op = &operation;
