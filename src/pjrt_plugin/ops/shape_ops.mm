@@ -787,7 +787,7 @@ static MPSGraphTensor* Handle_gather(MPSGraph* g, mlir::Operation* op, ValueMap&
     }
 
     // General gatherND lowering for patterns where index vectors are carried in
-    // the last indices dimension, which covers advanced indexing used by Haliax.
+    // the last indices dimension, which covers common advanced-indexing forms.
     if (indexVectorDim == (int64_t)indicesRank - 1) {
         MPSGraphTensor* ndIndices = EnsureInt32(g, startIndices);
         return [g gatherNDWithUpdatesTensor:operand indicesTensor:ndIndices batchDimensions:0 name:nil];
