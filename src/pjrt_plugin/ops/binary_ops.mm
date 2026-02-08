@@ -98,6 +98,9 @@ static MPSGraphTensor* Handle_dot_general(MPSGraph* g, mlir::Operation* op, Valu
 
     // Keep runtime tensor shapes aligned with StableHLO types so subsequent
     // dimension-number reasoning matches the op signature.
+    // Example: the runtime tensor can arrive as [6, 4] while the StableHLO
+    // operand type is [2, 3, 4] (same element count). If we do not normalize
+    // first, contracting/batching dimensions are interpreted on the wrong axes.
     NSArray<NSNumber*>* lhsExpectedShape = GetValueShape(op->getOperand(0));
     NSArray<NSNumber*>* rhsExpectedShape = GetValueShape(op->getOperand(1));
     if (lhsExpectedShape && lhs.shape && ![lhs.shape isEqualToArray:lhsExpectedShape]) {
