@@ -29,6 +29,31 @@ def make_slice_op_configs():
                 numpy.array([0, 2, 4]),
             ),
             OperationTestConfig(
+                lambda a, ix, iy: a[jnp.arange(a.shape[0]), ix, :, iy],
+                numpy.random.normal(size=(2, 4, 6, 5)).astype(numpy.float32),
+                numpy.array([0, 2], dtype=numpy.int32),
+                numpy.array([1, 3], dtype=numpy.int32),
+                differentiable_argnums=(),
+            ),
+            OperationTestConfig(
+                lambda logits, idx: logits[
+                    jnp.arange(logits.shape[0])[:, None, None],
+                    jnp.arange(logits.shape[1])[None, None, :],
+                    idx[:, :, None],
+                ],
+                numpy.random.normal(size=(2, 3, 5)).astype(numpy.float32),
+                numpy.array([[0, 1, 2, 3], [4, 0, 1, 2]], dtype=numpy.int32),
+                differentiable_argnums=(),
+                name="advanced_gather-new-axis",
+            ),
+            OperationTestConfig(
+                lambda x, idx: jnp.take_along_axis(x, idx, axis=2),
+                numpy.random.normal(size=(2, 3, 4, 5)).astype(numpy.float32),
+                numpy.random.randint(0, 4, size=(2, 3, 6, 5), dtype=numpy.int32),
+                differentiable_argnums=(),
+                name="take_along_axis-high-rank-batched",
+            ),
+            OperationTestConfig(
                 lambda x, idx, val: x.at[idx].set(val),
                 lambda rng: rng.normal(size=(5, 3)),
                 numpy.array([0, 2]),
