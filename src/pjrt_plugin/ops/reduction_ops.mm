@@ -174,80 +174,148 @@ static MPSGraphTensor* Handle_reduce_window(MPSGraph* g, mlir::Operation* op, Va
         return nullptr;
     }
 
-    // Pooling-style reduce_window for 1D/2D windows (max/min/sum), lowered via 2D pooling.
-    if ((rank == 1 || rank == 2) &&
-        (reductionType == "stablehlo.maximum" || reductionType == "stablehlo.minimum")) {
-        int64_t kH = 1, kW = 1;
-        int64_t sH = 1, sW = 1;
-        int64_t dH = 1, dW = 1;
-        int64_t pTop = 0, pBottom = 0, pLeft = 0, pRight = 0;
-
+    // Pooling-style reduce_window for add/max/min. Lower each active axis independently
+    // by reshaping to a 1D pooling problem. This supports rank-agnostic rectangular windows.
+    if (reductionType == "stablehlo.add" || reductionType == "stablehlo.maximum" ||
+        reductionType == "stablehlo.minimum") {
         for (int64_t i = 0; i < rank; ++i) {
-            int64_t wd = windowDims[(size_t)i];
-            int64_t stride = windowStrides.empty() ? 1 : windowStrides[(size_t)i];
             int64_t baseDil = baseDilations.empty() ? 1 : baseDilations[(size_t)i];
-            int64_t winDil = windowDilations.empty() ? 1 : windowDilations[(size_t)i];
-            int64_t padLow = maybePadding ? padding.getValues<int64_t>()[{(uint64_t)i, (uint64_t)0}] : 0;
-            int64_t padHigh = maybePadding ? padding.getValues<int64_t>()[{(uint64_t)i, (uint64_t)1}] : 0;
-
             if (baseDil != 1) {
                 MPS_LOG_ERROR(" reduce_window pooling with base dilation is unsupported\n");
                 return nullptr;
             }
+        }
 
-            if (rank == 1) {
-                kW = wd;
-                sW = stride;
-                dW = winDil;
-                pLeft = padLow;
-                pRight = padHigh;
-            } else if (i == 0) {
-                kH = wd;
-                sH = stride;
-                dH = winDil;
-                pTop = padLow;
-                pBottom = padHigh;
-            } else {
-                kW = wd;
-                sW = stride;
-                dW = winDil;
-                pLeft = padLow;
-                pRight = padHigh;
+        auto productOfDims = [](NSArray<NSNumber*>* shape, const std::vector<int64_t>& dims) -> int64_t {
+            int64_t p = 1;
+            for (int64_t d : dims) {
+                p *= [shape[(NSUInteger)d] longLongValue];
             }
-        }
+            return p;
+        };
 
-        MPSGraphTensor* poolInput = input;
-        if (rank == 1) {
-            int64_t inputLen = [inputShape[0] longLongValue];
-            poolInput = [g reshapeTensor:input withShape:@[ @1, @1, @(inputLen), @1 ] name:nil];
-        } else {
-            int64_t h = [inputShape[0] longLongValue];
-            int64_t w = [inputShape[1] longLongValue];
-            poolInput = [g reshapeTensor:input withShape:@[ @1, @(h), @(w), @1 ] name:nil];
-        }
+        MPSGraphTensor* pooled = input;
+        for (int64_t axis = 0; axis < rank; ++axis) {
+            int64_t wd = windowDims[(size_t)axis];
+            int64_t stride = windowStrides.empty() ? 1 : windowStrides[(size_t)axis];
+            int64_t winDil = windowDilations.empty() ? 1 : windowDilations[(size_t)axis];
+            int64_t padLow = maybePadding ? padding.getValues<int64_t>()[{(uint64_t)axis, (uint64_t)0}] : 0;
+            int64_t padHigh = maybePadding ? padding.getValues<int64_t>()[{(uint64_t)axis, (uint64_t)1}] : 0;
+            bool isIdentityAxis =
+                wd == 1 && stride == 1 && winDil == 1 && padLow == 0 && padHigh == 0;
+            if (isIdentityAxis) {
+                continue;
+            }
 
-        MPSGraphTensor* poolSource = poolInput;
-        if (reductionType == "stablehlo.minimum") {
-            poolSource = [g negativeWithTensor:poolInput name:nil];
-        }
+            NSArray<NSNumber*>* curShape = pooled.shape;
+            if (!curShape || curShape.count != (NSUInteger)rank) {
+                MPS_LOG_ERROR(" reduce_window pooling shape/rank mismatch during lowering\n");
+                return nullptr;
+            }
 
-        MPSGraphPooling2DOpDescriptor* poolDesc = [MPSGraphPooling2DOpDescriptor
-            descriptorWithKernelWidth:(NSUInteger)kW
-                          kernelHeight:(NSUInteger)kH
-                             strideInX:(NSUInteger)sW
-                             strideInY:(NSUInteger)sH
-                       dilationRateInX:(NSUInteger)dW
-                       dilationRateInY:(NSUInteger)dH
-                           paddingLeft:(NSUInteger)pLeft
-                          paddingRight:(NSUInteger)pRight
-                            paddingTop:(NSUInteger)pTop
-                         paddingBottom:(NSUInteger)pBottom
-                          paddingStyle:MPSGraphPaddingStyleExplicit
-                            dataLayout:MPSGraphTensorNamedDataLayoutNHWC];
+            std::vector<int64_t> otherDims;
+            otherDims.reserve((size_t)rank - 1);
+            for (int64_t d = 0; d < rank; ++d) {
+                if (d != axis)
+                    otherDims.push_back(d);
+            }
 
-        MPSGraphTensor* pooled = [g maxPooling2DWithSourceTensor:poolSource descriptor:poolDesc name:nil];
-        if (reductionType == "stablehlo.minimum") {
-            pooled = [g negativeWithTensor:pooled name:nil];
+            NSMutableArray<NSNumber*>* perm = [NSMutableArray array];
+            for (int64_t d : otherDims)
+                [perm addObject:@(d)];
+            [perm addObject:@(axis)];
+
+            MPSGraphTensor* transposed = pooled;
+            bool isIdentityPerm = true;
+            for (NSUInteger i = 0; i < perm.count; ++i) {
+                if ([perm[i] integerValue] != (NSInteger)i) {
+                    isIdentityPerm = false;
+                    break;
+                }
+            }
+            if (!isIdentityPerm) {
+                transposed = [g transposeTensor:pooled permutation:perm name:nil];
+            }
+
+            int64_t batch = productOfDims(curShape, otherDims);
+            int64_t axisLen = [curShape[(NSUInteger)axis] longLongValue];
+            MPSGraphTensor* pooledInput =
+                [g reshapeTensor:transposed withShape:@[ @(batch), @1, @(axisLen), @1 ] name:nil];
+
+            MPSGraphTensor* poolSource = pooledInput;
+            if (reductionType == "stablehlo.minimum") {
+                poolSource = [g negativeWithTensor:pooledInput name:nil];
+            }
+
+            MPSDataType origType = poolSource.dataType;
+            bool castForAvg = false;
+            if (reductionType == "stablehlo.add" &&
+                !(origType == MPSDataTypeFloat16 || origType == MPSDataTypeFloat32 ||
+                  origType == MPSDataTypeBFloat16)) {
+                poolSource = [g castTensor:poolSource toType:MPSDataTypeFloat32 name:nil];
+                castForAvg = true;
+            }
+
+            MPSGraphPooling2DOpDescriptor* poolDesc = [MPSGraphPooling2DOpDescriptor
+                descriptorWithKernelWidth:(NSUInteger)wd
+                              kernelHeight:1
+                                 strideInX:(NSUInteger)stride
+                                 strideInY:1
+                           dilationRateInX:(NSUInteger)winDil
+                           dilationRateInY:1
+                               paddingLeft:(NSUInteger)padLow
+                              paddingRight:(NSUInteger)padHigh
+                                paddingTop:0
+                             paddingBottom:0
+                              paddingStyle:MPSGraphPaddingStyleExplicit
+                                dataLayout:MPSGraphTensorNamedDataLayoutNHWC];
+            MPSGraphTensor* axisPooled = nullptr;
+            if (reductionType == "stablehlo.add") {
+                poolDesc.includeZeroPadToAverage = YES;
+                axisPooled = [g avgPooling2DWithSourceTensor:poolSource descriptor:poolDesc name:nil];
+                MPSGraphTensor* scale =
+                    [g constantWithScalar:wd shape:@[] dataType:axisPooled.dataType];
+                axisPooled = [g multiplicationWithPrimaryTensor:axisPooled secondaryTensor:scale name:nil];
+                if (castForAvg) {
+                    axisPooled = [g castTensor:axisPooled toType:origType name:nil];
+                }
+            } else {
+                axisPooled = [g maxPooling2DWithSourceTensor:poolSource descriptor:poolDesc name:nil];
+                if (reductionType == "stablehlo.minimum") {
+                    axisPooled = [g negativeWithTensor:axisPooled name:nil];
+                }
+            }
+            if (!axisPooled) {
+                MPS_LOG_ERROR(" reduce_window pooling lowering failed on axis %lld\n", axis);
+                return nullptr;
+            }
+
+            NSArray<NSNumber*>* axisShape = axisPooled.shape;
+            if (!axisShape || axisShape.count != 4) {
+                MPS_LOG_ERROR(" reduce_window pooled axis shape mismatch\n");
+                return nullptr;
+            }
+            int64_t outLen = [axisShape[2] longLongValue];
+
+            NSMutableArray<NSNumber*>* backShape = [NSMutableArray array];
+            for (int64_t d : otherDims) {
+                [backShape addObject:curShape[(NSUInteger)d]];
+            }
+            [backShape addObject:@(outLen)];
+            MPSGraphTensor* restored = [g reshapeTensor:axisPooled withShape:backShape name:nil];
+
+            NSMutableArray<NSNumber*>* invPerm = [NSMutableArray array];
+            for (int64_t i = 0; i < rank; ++i)
+                [invPerm addObject:@0];
+            for (NSUInteger i = 0; i < perm.count; ++i) {
+                NSInteger p = [perm[i] integerValue];
+                invPerm[(NSUInteger)p] = @(i);
+            }
+
+            if (!isIdentityPerm) {
+                restored = [g transposeTensor:restored permutation:invPerm name:nil];
+            }
+            pooled = restored;
         }
 
         NSArray<NSNumber*>* outputShape = GetOutputShape(op);
@@ -255,67 +323,6 @@ static MPSGraphTensor* Handle_reduce_window(MPSGraph* g, mlir::Operation* op, Va
             pooled = [g reshapeTensor:pooled withShape:outputShape name:nil];
         }
         return pooled;
-    }
-
-    // Batched 2D pooling: rank-3 input [B, H, W] with identity batch window.
-    if (rank == 3 && (reductionType == "stablehlo.maximum" || reductionType == "stablehlo.minimum")) {
-        int64_t w0 = windowDims[0];
-        int64_t s0 = windowStrides.empty() ? 1 : windowStrides[0];
-        int64_t b0 = baseDilations.empty() ? 1 : baseDilations[0];
-        int64_t d0 = windowDilations.empty() ? 1 : windowDilations[0];
-        int64_t pl0 = maybePadding ? padding.getValues<int64_t>()[{0, 0}] : 0;
-        int64_t ph0 = maybePadding ? padding.getValues<int64_t>()[{0, 1}] : 0;
-        if (w0 == 1 && s0 == 1 && b0 == 1 && d0 == 1 && pl0 == 0 && ph0 == 0) {
-            int64_t kH = windowDims[1], kW = windowDims[2];
-            int64_t sH = windowStrides.empty() ? 1 : windowStrides[1];
-            int64_t sW = windowStrides.empty() ? 1 : windowStrides[2];
-            int64_t dH = windowDilations.empty() ? 1 : windowDilations[1];
-            int64_t dW = windowDilations.empty() ? 1 : windowDilations[2];
-            int64_t bH = baseDilations.empty() ? 1 : baseDilations[1];
-            int64_t bW = baseDilations.empty() ? 1 : baseDilations[2];
-            int64_t pTop = maybePadding ? padding.getValues<int64_t>()[{1, 0}] : 0;
-            int64_t pBottom = maybePadding ? padding.getValues<int64_t>()[{1, 1}] : 0;
-            int64_t pLeft = maybePadding ? padding.getValues<int64_t>()[{2, 0}] : 0;
-            int64_t pRight = maybePadding ? padding.getValues<int64_t>()[{2, 1}] : 0;
-            if (bH != 1 || bW != 1) {
-                MPS_LOG_ERROR(" reduce_window pooling with base dilation is unsupported\n");
-                return nullptr;
-            }
-
-            int64_t B = [inputShape[0] longLongValue];
-            int64_t H = [inputShape[1] longLongValue];
-            int64_t W = [inputShape[2] longLongValue];
-            MPSGraphTensor* poolInput =
-                [g reshapeTensor:input withShape:@[ @(B), @(H), @(W), @1 ] name:nil];
-            MPSGraphTensor* poolSource = poolInput;
-            if (reductionType == "stablehlo.minimum") {
-                poolSource = [g negativeWithTensor:poolInput name:nil];
-            }
-
-            MPSGraphPooling2DOpDescriptor* poolDesc = [MPSGraphPooling2DOpDescriptor
-                descriptorWithKernelWidth:(NSUInteger)kW
-                              kernelHeight:(NSUInteger)kH
-                                 strideInX:(NSUInteger)sW
-                                 strideInY:(NSUInteger)sH
-                           dilationRateInX:(NSUInteger)dW
-                           dilationRateInY:(NSUInteger)dH
-                               paddingLeft:(NSUInteger)pLeft
-                              paddingRight:(NSUInteger)pRight
-                                paddingTop:(NSUInteger)pTop
-                             paddingBottom:(NSUInteger)pBottom
-                              paddingStyle:MPSGraphPaddingStyleExplicit
-                                dataLayout:MPSGraphTensorNamedDataLayoutNHWC];
-            MPSGraphTensor* pooled = [g maxPooling2DWithSourceTensor:poolSource descriptor:poolDesc name:nil];
-            if (reductionType == "stablehlo.minimum") {
-                pooled = [g negativeWithTensor:pooled name:nil];
-            }
-
-            NSArray<NSNumber*>* outputShape = GetOutputShape(op);
-            if (outputShape && pooled) {
-                pooled = [g reshapeTensor:pooled withShape:outputShape name:nil];
-            }
-            return pooled;
-        }
     }
 
     // Support the canonical cumulative lowering:
@@ -395,6 +402,279 @@ static MPSGraphTensor* Handle_reduce_window(MPSGraph* g, mlir::Operation* op, Va
     return result;
 }
 REGISTER_MPS_OP("stablehlo.reduce_window", Handle_reduce_window);
+
+enum class SelectScatterKind { kUnknown, kMax, kMin };
+
+static bool TryGetI64ListAttr(mlir::Operation* op, llvm::StringRef name,
+                              std::vector<int64_t>& out) {
+    if (auto dense = op->getAttrOfType<mlir::DenseI64ArrayAttr>(name)) {
+        out.assign(dense.asArrayRef().begin(), dense.asArrayRef().end());
+        return true;
+    }
+    if (auto arr = op->getAttrOfType<mlir::ArrayAttr>(name)) {
+        out.clear();
+        out.reserve(arr.size());
+        for (mlir::Attribute attr : arr) {
+            auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(attr);
+            if (!intAttr) {
+                return false;
+            }
+            out.push_back(intAttr.getInt());
+        }
+        return true;
+    }
+    return false;
+}
+
+static SelectScatterKind GetSelectScatterKind(mlir::Region& selectRegion) {
+    if (selectRegion.empty()) {
+        return SelectScatterKind::kUnknown;
+    }
+    for (mlir::Operation& nestedOp : selectRegion.front()) {
+        auto compareOp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(&nestedOp);
+        if (!compareOp) {
+            continue;
+        }
+        auto dir = compareOp.getComparisonDirection();
+        if (dir == mlir::stablehlo::ComparisonDirection::GE ||
+            dir == mlir::stablehlo::ComparisonDirection::GT) {
+            return SelectScatterKind::kMax;
+        }
+        if (dir == mlir::stablehlo::ComparisonDirection::LE ||
+            dir == mlir::stablehlo::ComparisonDirection::LT) {
+            return SelectScatterKind::kMin;
+        }
+    }
+    return SelectScatterKind::kUnknown;
+}
+
+static MPSGraphTensor* Handle_select_and_scatter(MPSGraph* g, mlir::Operation* op,
+                                                 ValueMap& values) {
+    auto sasOp = mlir::dyn_cast<mlir::stablehlo::SelectAndScatterOp>(op);
+    if (!sasOp) {
+        MPS_LOG_ERROR(" Expected SelectAndScatterOp\n");
+        return nullptr;
+    }
+
+    MPSGraphTensor* operand = GetInputTensor(values, op, 0);
+    MPSGraphTensor* source = GetInputTensor(values, op, 1);
+    if (!operand || !source) {
+        MPS_LOG_ERROR(" select_and_scatter operand/source tensor not found\n");
+        return nullptr;
+    }
+
+    std::string scatterType = GetReductionOpType(sasOp.getScatter());
+    if (scatterType != "stablehlo.add") {
+        MPS_LOG_ERROR(" select_and_scatter only supports add scatter, got %s\n", scatterType.c_str());
+        return nullptr;
+    }
+    SelectScatterKind kind = GetSelectScatterKind(sasOp.getSelect());
+    if (kind == SelectScatterKind::kUnknown) {
+        MPS_LOG_ERROR(" select_and_scatter only supports compare-based max/min select\n");
+        return nullptr;
+    }
+
+    std::vector<int64_t> windowDimsStorage;
+    std::vector<int64_t> windowStridesStorage;
+    mlir::DenseIntElementsAttr padding = op->getAttrOfType<mlir::DenseIntElementsAttr>("padding");
+
+    if (!TryGetI64ListAttr(op, "window_dimensions", windowDimsStorage)) {
+        if (auto dimsAttr = sasOp.getWindowDimensionsAttr()) {
+            windowDimsStorage.assign(dimsAttr.asArrayRef().begin(), dimsAttr.asArrayRef().end());
+        }
+    }
+    if (!TryGetI64ListAttr(op, "window_strides", windowStridesStorage)) {
+        if (auto stridesAttr = sasOp.getWindowStridesAttr()) {
+            windowStridesStorage.assign(stridesAttr.asArrayRef().begin(), stridesAttr.asArrayRef().end());
+        }
+    }
+    if (!padding) {
+        if (auto paddingAttr = sasOp.getPaddingAttr()) {
+            padding = paddingAttr;
+        }
+    }
+    if (windowDimsStorage.empty()) {
+        MPS_LOG_ERROR(" select_and_scatter requires window_dimensions\n");
+        return nullptr;
+    }
+
+    NSArray<NSNumber*>* operandShape = operand.shape;
+    NSArray<NSNumber*>* sourceShape = source.shape;
+    if (!operandShape) {
+        MPS_LOG_ERROR(" select_and_scatter operand shape missing\n");
+        return nullptr;
+    }
+    if (!sourceShape) {
+        MPS_LOG_ERROR(" select_and_scatter source shape missing\n");
+        return nullptr;
+    }
+    const int64_t rank = (int64_t)operandShape.count;
+    if ((int64_t)sourceShape.count != rank) {
+        MPS_LOG_ERROR(" select_and_scatter source/operand rank mismatch\n");
+        return nullptr;
+    }
+    if (windowStridesStorage.empty()) {
+        windowStridesStorage.assign((size_t)rank, 1);
+    }
+    llvm::ArrayRef<int64_t> windowDims(windowDimsStorage);
+    llvm::ArrayRef<int64_t> windowStrides(windowStridesStorage);
+    if ((int64_t)windowDims.size() != rank || (int64_t)windowStrides.size() != rank) {
+        MPS_LOG_ERROR(" select_and_scatter rank/attribute mismatch\n");
+        return nullptr;
+    }
+    if (padding &&
+        (padding.getType().getRank() != 2 || padding.getType().getShape()[0] != rank ||
+         padding.getType().getShape()[1] != 2)) {
+        MPS_LOG_ERROR(" select_and_scatter padding rank/shape mismatch\n");
+        return nullptr;
+    }
+
+    auto padAt = [&](int64_t axis, int64_t loOrHi) -> int64_t {
+        if (!padding) {
+            return 0;
+        }
+        return padding.getValues<int64_t>()[{(uint64_t)axis, (uint64_t)loOrHi}];
+    };
+
+    std::vector<int64_t> activeAxes;
+    std::vector<int64_t> inactiveAxes;
+    activeAxes.reserve((size_t)rank);
+    inactiveAxes.reserve((size_t)rank);
+    for (int64_t i = 0; i < rank; ++i) {
+        int64_t wd = windowDims[(size_t)i];
+        int64_t ws = windowStrides[(size_t)i];
+        int64_t padLow = padAt(i, 0);
+        int64_t padHigh = padAt(i, 1);
+        if (wd < 1 || ws < 1 || padLow < 0 || padHigh < 0) {
+            MPS_LOG_ERROR(" select_and_scatter has invalid pooling attributes\n");
+            return nullptr;
+        }
+        bool identityAxis = wd == 1 && ws == 1 && padLow == 0 && padHigh == 0;
+        if (identityAxis) {
+            inactiveAxes.push_back(i);
+        } else {
+            activeAxes.push_back(i);
+        }
+    }
+    if (activeAxes.empty() || activeAxes.size() > 3) {
+        MPS_LOG_ERROR(" select_and_scatter supports at most 3 active window axes\n");
+        return nullptr;
+    }
+    if (inactiveAxes.empty()) {
+        MPS_LOG_ERROR(" select_and_scatter requires at least one identity axis for batching\n");
+        return nullptr;
+    }
+
+    NSMutableArray<NSNumber*>* perm = [NSMutableArray array];
+    for (int64_t axis : inactiveAxes)
+        [perm addObject:@(axis)];
+    for (int64_t axis : activeAxes)
+        [perm addObject:@(axis)];
+
+    bool isIdentityPerm = true;
+    for (NSUInteger i = 0; i < perm.count; ++i) {
+        if ([perm[i] integerValue] != (NSInteger)i) {
+            isIdentityPerm = false;
+            break;
+        }
+    }
+
+    MPSGraphTensor* permutedOperand = operand;
+    MPSGraphTensor* permutedSource = source;
+    if (!isIdentityPerm) {
+        permutedOperand = [g transposeTensor:operand permutation:perm name:nil];
+        permutedSource = [g transposeTensor:source permutation:perm name:nil];
+    }
+
+    int64_t batch = 1;
+    for (int64_t axis : inactiveAxes) {
+        batch *= [operandShape[(NSUInteger)axis] longLongValue];
+    }
+    NSMutableArray<NSNumber*>* operand4DShape = [NSMutableArray arrayWithObject:@(batch)];
+    NSMutableArray<NSNumber*>* source4DShape = [NSMutableArray arrayWithObject:@(batch)];
+    NSMutableArray<NSNumber*>* kernelSizes = [NSMutableArray arrayWithObject:@1];
+    NSMutableArray<NSNumber*>* strides = [NSMutableArray arrayWithObject:@1];
+    NSMutableArray<NSNumber*>* dilations = [NSMutableArray arrayWithObject:@1];
+    NSMutableArray<NSNumber*>* paddingValues = [NSMutableArray arrayWithObjects:@0, @0, nil];
+    for (int64_t axis : activeAxes) {
+        int64_t inDim = [operandShape[(NSUInteger)axis] longLongValue];
+        int64_t outDim = [sourceShape[(NSUInteger)axis] longLongValue];
+        [operand4DShape addObject:@(inDim)];
+        [source4DShape addObject:@(outDim)];
+        [kernelSizes addObject:@(windowDims[(size_t)axis])];
+        [strides addObject:@(windowStrides[(size_t)axis])];
+        [dilations addObject:@1];
+        [paddingValues addObject:@(padAt(axis, 0))];
+        [paddingValues addObject:@(padAt(axis, 1))];
+    }
+    while (operand4DShape.count < 4) {
+        [operand4DShape addObject:@1];
+        [source4DShape addObject:@1];
+        [kernelSizes addObject:@1];
+        [strides addObject:@1];
+        [dilations addObject:@1];
+        [paddingValues addObject:@0];
+        [paddingValues addObject:@0];
+    }
+
+    MPSGraphTensor* operand4D = [g reshapeTensor:permutedOperand withShape:operand4DShape name:nil];
+    MPSGraphTensor* source4D = [g reshapeTensor:permutedSource withShape:source4DShape name:nil];
+
+    MPSGraphPooling4DOpDescriptor* poolDesc =
+        [MPSGraphPooling4DOpDescriptor descriptorWithKernelSizes:kernelSizes
+                                                         strides:strides
+                                                   dilationRates:dilations
+                                                   paddingValues:paddingValues
+                                                    paddingStyle:MPSGraphPaddingStyleExplicit];
+    if (!poolDesc) {
+        MPS_LOG_ERROR(" select_and_scatter failed to create pooling descriptor\n");
+        return nullptr;
+    }
+
+    MPSGraphTensor* srcForSelect = operand4D;
+    if (kind == SelectScatterKind::kMin) {
+        srcForSelect = [g negativeWithTensor:operand4D name:nil];
+    }
+
+    MPSGraphTensor* result = [g maxPooling4DGradientWithGradientTensor:source4D
+                                                           sourceTensor:srcForSelect
+                                                             descriptor:poolDesc
+                                                                   name:nil];
+    if (!result) {
+        MPS_LOG_ERROR(" select_and_scatter pooling gradient lowering failed\n");
+        return nullptr;
+    }
+
+    MPSDataType outType = GetResultMpsType(op);
+    if (outType != MPSDataTypeInvalid && result.dataType != outType) {
+        result = [g castTensor:result toType:outType name:nil];
+    }
+
+    NSMutableArray<NSNumber*>* permutedResultShape = [NSMutableArray array];
+    for (int64_t axis : inactiveAxes)
+        [permutedResultShape addObject:operandShape[(NSUInteger)axis]];
+    for (int64_t axis : activeAxes)
+        [permutedResultShape addObject:operandShape[(NSUInteger)axis]];
+    result = [g reshapeTensor:result withShape:permutedResultShape name:nil];
+
+    if (!isIdentityPerm) {
+        NSMutableArray<NSNumber*>* invPerm = [NSMutableArray array];
+        for (int64_t i = 0; i < rank; ++i)
+            [invPerm addObject:@0];
+        for (NSUInteger i = 0; i < perm.count; ++i) {
+            NSInteger p = [perm[i] integerValue];
+            invPerm[(NSUInteger)p] = @(i);
+        }
+        result = [g transposeTensor:result permutation:invPerm name:nil];
+    }
+
+    NSArray<NSNumber*>* outputShape = GetOutputShape(op);
+    if (outputShape && result) {
+        result = [g reshapeTensor:result withShape:outputShape name:nil];
+    }
+    return result;
+}
+REGISTER_MPS_OP("stablehlo.select_and_scatter", Handle_select_and_scatter);
 
 // stablehlo.return is a terminator used inside regions (e.g., reduce body)
 // It's handled implicitly by parent operations, not executed directly

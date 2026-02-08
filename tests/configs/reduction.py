@@ -51,4 +51,18 @@ def make_reduction_op_configs():
                     numpy.random.standard_normal((2, 6, 6)).astype(numpy.float32),
                     differentiable_argnums=(),
                 ),
+                OperationTestConfig(
+                    lambda x: jnp.sum(
+                        lax.reduce_window(
+                            x,
+                            -jnp.inf,
+                            lax.max,
+                            window_dimensions=(1, 2, 2, 1),
+                            window_strides=(1, 2, 2, 1),
+                            padding=((0, 0), (0, 0), (0, 0), (0, 0)),
+                        )
+                    ),
+                    numpy.random.standard_normal((1, 6, 6, 1)).astype(numpy.float32),
+                    name="lax.reduce_window-max-grad-path",
+                ),
             ]
