@@ -403,8 +403,12 @@ static MPSGraphTensor* Handle_reduce_window(MPSGraph* g, mlir::Operation* op, Va
 }
 REGISTER_MPS_OP("stablehlo.reduce_window", Handle_reduce_window);
 
+// SelectAndScatter select-region classification.
+// kMax/kMin describe which operand is selected by the comparator body.
 enum class SelectScatterKind { kUnknown, kMax, kMin };
 
+// Read an i64 list attribute from either DenseI64ArrayAttr or ArrayAttr.
+// Returns false if the attribute is absent or contains non-integer elements.
 static bool TryGetI64ListAttr(mlir::Operation* op, llvm::StringRef name,
                               std::vector<int64_t>& out) {
     if (auto dense = op->getAttrOfType<mlir::DenseI64ArrayAttr>(name)) {
@@ -426,6 +430,12 @@ static bool TryGetI64ListAttr(mlir::Operation* op, llvm::StringRef name,
     return false;
 }
 
+// Infer select-and-scatter kind from the select region.
+// We intentionally only accept the canonical StableHLO comparator body:
+//   %pred = stablehlo.compare %arg{0|1}, %arg{1|0}
+//   stablehlo.return %pred
+// This avoids misclassifying non-canonical regions and ensures operand-order-
+// sensitive handling (compare(arg1, arg0) flips max/min interpretation).
 static SelectScatterKind GetSelectScatterKind(mlir::Region& selectRegion) {
     if (selectRegion.empty()) {
         return SelectScatterKind::kUnknown;
@@ -507,6 +517,7 @@ static MPSGraphTensor* Handle_select_and_scatter(MPSGraph* g, mlir::Operation* o
     }
     SelectScatterKind kind = GetSelectScatterKind(sasOp.getSelect());
     if (kind == SelectScatterKind::kUnknown) {
+        // Keep this strict rather than guessing from partial patterns.
         MPS_LOG_ERROR(" select_and_scatter only supports compare-based max/min select\n");
         return nullptr;
     }
