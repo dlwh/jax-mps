@@ -413,6 +413,9 @@ static ProcessResult HandleGather(MPSGraph* g, mlir::Operation* op, ValueMap& va
     auto dimNumbers = gatherOp.getDimensionNumbers();
     auto collapsedSliceDims = dimNumbers.getCollapsedSliceDims();
     auto startIndexMap = dimNumbers.getStartIndexMap();
+    auto sliceSizes = gatherOp.getSliceSizes();
+    auto operandBatchingDims = dimNumbers.getOperandBatchingDims();
+    auto startIndicesBatchingDims = dimNumbers.getStartIndicesBatchingDims();
     int64_t indexVectorDim = dimNumbers.getIndexVectorDim();
 
     // Handle common embedding lookup pattern:
@@ -445,6 +448,63 @@ static ProcessResult HandleGather(MPSGraph* g, mlir::Operation* op, ValueMap& va
 
         // Cast indices to int32 if needed (MPS gather requires int32)
         squeezedIndices = EnsureInt32(g, squeezedIndices);
+
+        // Scalar selector (e.g. jnp.take(x, i, axis=...)) lowered by XLA to
+        // gather with indices shape [1] or [1,1]. Lower directly via dynamic
+        // slice to avoid gatherWithUpdates crashes on high-rank operands.
+        if (startIndexMap.size() == 1 && operandBatchingDims.empty() &&
+            startIndicesBatchingDims.empty()) {
+            NSArray<NSNumber*>* squeezedIndicesShape = squeezedIndices.shape;
+            bool isScalarIndex = squeezedIndicesShape.count == 0 ||
+                                 (squeezedIndicesShape.count == 1 &&
+                                  [squeezedIndicesShape[0] integerValue] == 1);
+            if (isScalarIndex) {
+                MPSGraphTensor* scalarIndex = squeezedIndices;
+                if (scalarIndex.shape.count == 0) {
+                    scalarIndex = [g reshapeTensor:scalarIndex withShape:@[ @1 ] name:nil];
+                }
+                MPSGraphTensor* zero =
+                    [g constantWithScalar:0 shape:@[ @1 ] dataType:MPSDataTypeInt32];
+
+                NSMutableArray<MPSGraphTensor*>* startParts =
+                    [NSMutableArray arrayWithCapacity:operand.shape.count];
+                for (NSUInteger d = 0; d < operand.shape.count; ++d) {
+                    if ((int64_t)d == gatherAxis) {
+                        [startParts addObject:scalarIndex];
+                    } else {
+                        [startParts addObject:zero];
+                    }
+                }
+                MPSGraphTensor* startVec = [g concatTensors:startParts dimension:0 name:nil];
+
+                NSMutableArray<MPSGraphTensor*>* sizeParts =
+                    [NSMutableArray arrayWithCapacity:sliceSizes.size()];
+                for (int64_t sz : sliceSizes) {
+                    [sizeParts addObject:[g constantWithScalar:sz
+                                                         shape:@[ @1 ]
+                                                      dataType:MPSDataTypeInt32]];
+                }
+                MPSGraphTensor* sizeVec = [g concatTensors:sizeParts dimension:0 name:nil];
+
+                NSUInteger squeezeMask = 0;
+                for (int64_t dim : collapsedSliceDims) {
+                    if (dim >= 0 && dim < 63) {
+                        squeezeMask |= (1ULL << (NSUInteger)dim);
+                    }
+                }
+
+                MPSGraphTensor* sliced = [g sliceTensor:operand
+                                            startTensor:startVec
+                                             sizeTensor:sizeVec
+                                            squeezeMask:squeezeMask
+                                                   name:nil];
+                NSArray<NSNumber*>* outputShape = GetOutputShape(op);
+                if (outputShape) {
+                    sliced = [g reshapeTensor:sliced withShape:outputShape name:nil];
+                }
+                return Result(values, op, sliced, "gather");
+            }
+        }
 
         NSUInteger batchDims = 0;
         NSArray<NSNumber*>* operandShape = operand.shape;
@@ -517,6 +577,7 @@ static ProcessResult HandleGather(MPSGraph* g, mlir::Operation* op, ValueMap& va
                                                        axis:(NSUInteger)gatherAxis
                                             batchDimensions:batchDims
                                                        name:nil];
+        return Result(values, op, result, "gather");
     }
 
     // For now, log unsupported patterns
