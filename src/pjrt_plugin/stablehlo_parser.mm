@@ -36,6 +36,7 @@ const std::unordered_set<std::string>& getSupportedOps() {
         ops.insert("stablehlo.while");
         ops.insert("stablehlo.case");
         ops.insert("stablehlo.sort");
+        ops.insert("chlo.top_k");
         return ops;
     }();
     return supported;

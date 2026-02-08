@@ -19,6 +19,12 @@ def make_misc_op_configs():
                 differentiable_argnums=(),
             ),
             OperationTestConfig(
+                lambda x: lax.top_k(x, 3),
+                numpy.random.standard_normal((3, 7)).astype(numpy.float32),
+                differentiable_argnums=(),
+                name="lax.top_k",
+            ),
+            OperationTestConfig(
                 lambda selector, x: lax.switch(
                     selector,
                     [lambda y: y + 1, lambda y: y * 2, lambda y: y - 3],

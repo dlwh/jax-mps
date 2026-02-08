@@ -4,6 +4,8 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
+#include <algorithm>
+#include <cctype>
 #include <unordered_map>
 
 #import "pjrt_plugin/issue_url.h"
@@ -442,6 +444,113 @@ static ProcessResult processSortOp(MPSGraph* graph, mlir::Operation* op, ValueMa
     return ProcessResult::Error("Unsupported stablehlo.sort operand/result shape");
 }
 
+static int64_t inferTopKFromShapes(NSArray<NSNumber*>* inputShape, NSArray<NSNumber*>* outputShape) {
+    if (!inputShape || !outputShape || inputShape.count != outputShape.count ||
+        outputShape.count == 0) {
+        return -1;
+    }
+    for (NSUInteger i = 0; i < outputShape.count; ++i) {
+        int64_t inDim = [inputShape[i] longLongValue];
+        int64_t outDim = [outputShape[i] longLongValue];
+        if (inDim != outDim) {
+            return outDim;
+        }
+    }
+    return [outputShape.lastObject longLongValue];
+}
+
+static NSInteger inferTopKAxisFromShapes(NSArray<NSNumber*>* inputShape, NSArray<NSNumber*>* outputShape) {
+    if (!inputShape || !outputShape || inputShape.count != outputShape.count ||
+        inputShape.count == 0) {
+        return -1;
+    }
+    for (NSUInteger i = 0; i < outputShape.count; ++i) {
+        int64_t inDim = [inputShape[i] longLongValue];
+        int64_t outDim = [outputShape[i] longLongValue];
+        if (inDim != outDim) {
+            return (NSInteger)i;
+        }
+    }
+    return (NSInteger)inputShape.count - 1;
+}
+
+static bool isTopKCustomCallTarget(const std::string& target) {
+    std::string lower = target;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return lower.find("topk") != std::string::npos || lower.find("top_k") != std::string::npos;
+}
+
+static ProcessResult processTopKOp(MPSGraph* graph, mlir::Operation* op, ValueMap& values) {
+    if (op->getNumOperands() < 1 || op->getNumResults() != 2) {
+        return ProcessResult::Error("Unsupported top_k operand/result shape");
+    }
+
+    MPSGraphTensor* input = GetInputTensor(values, op, 0);
+    if (!input) {
+        return ProcessResult::Error("top_k input tensor not found");
+    }
+
+    int64_t k = -1;
+    if (auto kAttr = op->getAttrOfType<mlir::IntegerAttr>("k")) {
+        k = kAttr.getInt();
+    }
+
+    NSInteger axis = -1;
+    if (auto axisAttr = op->getAttrOfType<mlir::IntegerAttr>("axis")) {
+        axis = (NSInteger)axisAttr.getInt();
+    }
+
+    NSArray<NSNumber*>* valueShape = GetOutputShape(op, 0);
+    if (k < 0) {
+        k = inferTopKFromShapes(input.shape, valueShape);
+    }
+    if (axis < 0) {
+        axis = inferTopKAxisFromShapes(input.shape, valueShape);
+    }
+
+    if (k <= 0) {
+        return ProcessResult::Error("Failed to infer top_k parameter k");
+    }
+    if (axis < 0 || !input.shape || axis >= (NSInteger)input.shape.count) {
+        return ProcessResult::Error("Failed to infer top_k axis");
+    }
+
+    NSArray<MPSGraphTensor*>* topk = nil;
+    if (axis == (NSInteger)input.shape.count - 1) {
+        topk = [graph topKWithSourceTensor:input k:(NSUInteger)k name:nil];
+    } else {
+        topk = [graph topKWithSourceTensor:input axis:axis k:(NSUInteger)k name:nil];
+    }
+    if (!topk || topk.count != 2) {
+        return ProcessResult::Error("top_k lowering failed");
+    }
+
+    MPSGraphTensor* valueOut = topk[0];
+    MPSGraphTensor* indexOut = topk[1];
+
+    MPSDataType valueType = GetResultMpsType(op, 0);
+    if (valueType != MPSDataTypeInvalid && valueOut.dataType != valueType) {
+        valueOut = [graph castTensor:valueOut toType:valueType name:nil];
+    }
+    MPSDataType indexType = GetResultMpsType(op, 1);
+    if (indexType != MPSDataTypeInvalid && indexOut.dataType != indexType) {
+        indexOut = [graph castTensor:indexOut toType:indexType name:nil];
+    }
+
+    if (valueShape) {
+        valueOut = [graph reshapeTensor:valueOut withShape:valueShape name:nil];
+    }
+    NSArray<NSNumber*>* indexShape = GetOutputShape(op, 1);
+    if (indexShape) {
+        indexOut = [graph reshapeTensor:indexOut withShape:indexShape name:nil];
+    }
+
+    values[op->getResult(0).getAsOpaquePointer()] = valueOut;
+    values[op->getResult(1).getAsOpaquePointer()] = indexOut;
+    return ProcessResult{};
+}
+
 // Process a func.call operation by looking up the callee and processing its body
 static ProcessResult processCallOp(MPSGraph* graph, mlir::func::CallOp callOp, ValueMap& values,
                                    mlir::ModuleOp module, int depth) {
@@ -545,6 +654,23 @@ static ProcessResult processOperations(MPSGraph* graph, mlir::Block& block, Valu
             if (!sortResult.ok())
                 return sortResult;
             continue;
+        }
+        if (op_name == "chlo.top_k") {
+            ProcessResult topKResult = processTopKOp(graph, op, values);
+            if (!topKResult.ok())
+                return topKResult;
+            continue;
+        }
+        if (op_name == "stablehlo.custom_call" && op->getNumResults() == 2) {
+            if (auto customCallOp = mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
+                std::string target = customCallOp.getCallTargetName().str();
+                if (isTopKCustomCallTarget(target)) {
+                    ProcessResult topKResult = processTopKOp(graph, op, values);
+                    if (!topKResult.ok())
+                        return topKResult;
+                    continue;
+                }
+            }
         }
 
         // Look up handler in registry
