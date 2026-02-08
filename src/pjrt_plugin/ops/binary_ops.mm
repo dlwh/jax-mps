@@ -10,6 +10,15 @@ static bool IsMatmulSupportedType(MPSDataType t) {
            t == MPSDataTypeComplexFloat16 || t == MPSDataTypeComplexFloat32;
 }
 
+static bool ValidateMatmulInputTypes(MPSGraphTensor* lhs, MPSGraphTensor* rhs, const char* opName) {
+    if (!IsMatmulSupportedType(lhs.dataType) || !IsMatmulSupportedType(rhs.dataType)) {
+        MPS_LOG_ERROR("%s requires float16/float32/bfloat16/complex inputs. got lhs=%d rhs=%d\n",
+                      opName, (int)lhs.dataType, (int)rhs.dataType);
+        return false;
+    }
+    return true;
+}
+
 REGISTER_MLIR_BINARY_OP("stablehlo.add", addition, add);
 REGISTER_MLIR_BINARY_OP("stablehlo.subtract", subtraction, subtract);
 REGISTER_MLIR_BINARY_OP("stablehlo.multiply", multiplication, multiply);
@@ -27,13 +36,10 @@ static MPSGraphTensor* Handle_dot(MPSGraph* g, mlir::Operation* op, ValueMap& va
     if (!lhs || !rhs)
         return nullptr;
 
+    if (!ValidateMatmulInputTypes(lhs, rhs, "stablehlo.dot"))
+        return nullptr;
+
     MPSDataType outType = GetResultMpsType(op);
-    if (!IsMatmulSupportedType(lhs.dataType)) {
-        lhs = [g castTensor:lhs toType:MPSDataTypeFloat16 name:nil];
-    }
-    if (!IsMatmulSupportedType(rhs.dataType)) {
-        rhs = [g castTensor:rhs toType:MPSDataTypeFloat16 name:nil];
-    }
     MPSGraphTensor* mm = [g matrixMultiplicationWithPrimaryTensor:lhs secondaryTensor:rhs name:nil];
     if (outType != MPSDataTypeInvalid && mm.dataType != outType) {
         mm = [g castTensor:mm toType:outType name:nil];
@@ -55,13 +61,11 @@ static MPSGraphTensor* Handle_dot_general(MPSGraph* g, mlir::Operation* op, Valu
     MPSGraphTensor* rhs = GetInputTensor(values, op, 1);
     if (!lhs || !rhs)
         return nullptr;
+
+    if (!ValidateMatmulInputTypes(lhs, rhs, "stablehlo.dot_general"))
+        return nullptr;
+
     MPSDataType outType = GetResultMpsType(op);
-    if (!IsMatmulSupportedType(lhs.dataType)) {
-        lhs = [g castTensor:lhs toType:MPSDataTypeFloat16 name:nil];
-    }
-    if (!IsMatmulSupportedType(rhs.dataType)) {
-        rhs = [g castTensor:rhs toType:MPSDataTypeFloat16 name:nil];
-    }
 
     auto dimNumbers = dotOp.getDotDimensionNumbers();
     auto lhsContractingDims = dimNumbers.getLhsContractingDimensions();
