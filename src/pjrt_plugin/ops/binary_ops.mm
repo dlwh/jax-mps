@@ -5,6 +5,40 @@
 
 namespace jax_mps {
 
+static NSArray<NSNumber*>* GetValueShape(mlir::Value value) {
+    auto tensorType = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    if (!tensorType) {
+        return nil;
+    }
+    NSMutableArray<NSNumber*>* shape = [NSMutableArray array];
+    for (int64_t dim : tensorType.getShape()) {
+        [shape addObject:@(dim)];
+    }
+    return shape;
+}
+
+static int64_t ShapeNumElements(NSArray<NSNumber*>* shape) {
+    int64_t p = 1;
+    for (NSNumber* dim : shape) {
+        p *= [dim longLongValue];
+    }
+    return p;
+}
+
+static bool IsBroadcastCompatible(NSArray<NSNumber*>* inShape, NSArray<NSNumber*>* outShape) {
+    if (!inShape || !outShape || inShape.count != outShape.count) {
+        return false;
+    }
+    for (NSUInteger i = 0; i < outShape.count; ++i) {
+        int64_t inDim = [inShape[i] longLongValue];
+        int64_t outDim = [outShape[i] longLongValue];
+        if (!(inDim == outDim || inDim == 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool IsMatmulSupportedType(MPSDataType t) {
     return t == MPSDataTypeFloat16 || t == MPSDataTypeFloat32 || t == MPSDataTypeBFloat16 ||
            t == MPSDataTypeComplexFloat16 || t == MPSDataTypeComplexFloat32;
@@ -62,6 +96,35 @@ static MPSGraphTensor* Handle_dot_general(MPSGraph* g, mlir::Operation* op, Valu
     if (!lhs || !rhs)
         return nullptr;
 
+    // Keep runtime tensor shapes aligned with StableHLO types so subsequent
+    // dimension-number reasoning matches the op signature.
+    NSArray<NSNumber*>* lhsExpectedShape = GetValueShape(op->getOperand(0));
+    NSArray<NSNumber*>* rhsExpectedShape = GetValueShape(op->getOperand(1));
+    if (lhsExpectedShape && lhs.shape && ![lhs.shape isEqualToArray:lhsExpectedShape]) {
+        if (ShapeNumElements(lhs.shape) == ShapeNumElements(lhsExpectedShape)) {
+            lhs = [g reshapeTensor:lhs withShape:lhsExpectedShape name:nil];
+        } else if (IsBroadcastCompatible(lhs.shape, lhsExpectedShape)) {
+            lhs = [g broadcastTensor:lhs toShape:lhsExpectedShape name:nil];
+        } else {
+            MPS_LOG_ERROR("dot_general: lhs shape mismatch %s vs expected %s\n",
+                          [[lhs.shape description] UTF8String],
+                          [[lhsExpectedShape description] UTF8String]);
+            return nullptr;
+        }
+    }
+    if (rhsExpectedShape && rhs.shape && ![rhs.shape isEqualToArray:rhsExpectedShape]) {
+        if (ShapeNumElements(rhs.shape) == ShapeNumElements(rhsExpectedShape)) {
+            rhs = [g reshapeTensor:rhs withShape:rhsExpectedShape name:nil];
+        } else if (IsBroadcastCompatible(rhs.shape, rhsExpectedShape)) {
+            rhs = [g broadcastTensor:rhs toShape:rhsExpectedShape name:nil];
+        } else {
+            MPS_LOG_ERROR("dot_general: rhs shape mismatch %s vs expected %s\n",
+                          [[rhs.shape description] UTF8String],
+                          [[rhsExpectedShape description] UTF8String]);
+            return nullptr;
+        }
+    }
+
     if (!ValidateMatmulInputTypes(lhs, rhs, "stablehlo.dot_general"))
         return nullptr;
 
@@ -73,8 +136,8 @@ static MPSGraphTensor* Handle_dot_general(MPSGraph* g, mlir::Operation* op, Valu
     auto lhsBatchDims = dimNumbers.getLhsBatchingDimensions();
     auto rhsBatchDims = dimNumbers.getRhsBatchingDimensions();
 
-    NSArray<NSNumber*>* lhsShape = lhs.shape;
-    NSArray<NSNumber*>* rhsShape = rhs.shape;
+    NSArray<NSNumber*>* lhsShape = lhsExpectedShape ? lhsExpectedShape : lhs.shape;
+    NSArray<NSNumber*>* rhsShape = rhsExpectedShape ? rhsExpectedShape : rhs.shape;
     NSUInteger lhsRank = lhsShape.count;
     NSUInteger rhsRank = rhsShape.count;
 
@@ -173,11 +236,28 @@ static MPSGraphTensor* Handle_dot_general(MPSGraph* g, mlir::Operation* op, Valu
                 p *= [shape[(NSUInteger)d] longLongValue];
             return p;
         };
-
-        int64_t b = lhsBatch.empty() ? 1 : product(lhsShape, lhsBatch);
         int64_t m = lhsNonContract.empty() ? 1 : product(lhsShape, lhsNonContract);
         int64_t k = lhsContract.empty() ? 1 : product(lhsShape, lhsContract);
         int64_t n = rhsNonContract.empty() ? 1 : product(rhsShape, rhsNonContract);
+
+        std::vector<int64_t> batchShape;
+        batchShape.reserve(lhsBatch.size());
+        for (size_t i = 0; i < lhsBatch.size(); ++i) {
+            int64_t lhsDim = [lhsShape[(NSUInteger)lhsBatch[i]] longLongValue];
+            int64_t rhsDim = [rhsShape[(NSUInteger)rhsBatch[i]] longLongValue];
+            if (lhsDim == rhsDim) {
+                batchShape.push_back(lhsDim);
+            } else if (lhsDim == 1 || rhsDim == 1) {
+                batchShape.push_back(std::max(lhsDim, rhsDim));
+            } else {
+                MPS_LOG_ERROR("dot_general: incompatible batch dims lhs=%lld rhs=%lld\n",
+                              (long long)lhsDim, (long long)rhsDim);
+                return nullptr;
+            }
+        }
+        int64_t b = 1;
+        for (int64_t dim : batchShape)
+            b *= dim;
 
         NSMutableArray<NSNumber*>* lhsPerm = [NSMutableArray array];
         for (int64_t d : lhsBatch)
@@ -204,6 +284,41 @@ static MPSGraphTensor* Handle_dot_general(MPSGraph* g, mlir::Operation* op, Valu
             rhsT = [g transposeTensor:rhs permutation:rhsPerm name:nil];
         }
 
+        if (!batchShape.empty()) {
+            bool lhsNeedsBroadcast = false;
+            bool rhsNeedsBroadcast = false;
+            for (size_t i = 0; i < batchShape.size(); ++i) {
+                int64_t lhsDim = [lhsShape[(NSUInteger)lhsBatch[i]] longLongValue];
+                int64_t rhsDim = [rhsShape[(NSUInteger)rhsBatch[i]] longLongValue];
+                if (lhsDim != batchShape[i])
+                    lhsNeedsBroadcast = true;
+                if (rhsDim != batchShape[i])
+                    rhsNeedsBroadcast = true;
+            }
+
+            if (lhsNeedsBroadcast) {
+                NSMutableArray<NSNumber*>* lhsExpandedShape = [NSMutableArray array];
+                for (int64_t dim : batchShape)
+                    [lhsExpandedShape addObject:@(dim)];
+                for (int64_t d : lhsNonContract)
+                    [lhsExpandedShape addObject:lhsShape[(NSUInteger)d]];
+                for (int64_t d : lhsContract)
+                    [lhsExpandedShape addObject:lhsShape[(NSUInteger)d]];
+                lhsT = [g broadcastTensor:lhsT toShape:lhsExpandedShape name:nil];
+            }
+
+            if (rhsNeedsBroadcast) {
+                NSMutableArray<NSNumber*>* rhsExpandedShape = [NSMutableArray array];
+                for (int64_t dim : batchShape)
+                    [rhsExpandedShape addObject:@(dim)];
+                for (int64_t d : rhsContract)
+                    [rhsExpandedShape addObject:rhsShape[(NSUInteger)d]];
+                for (int64_t d : rhsNonContract)
+                    [rhsExpandedShape addObject:rhsShape[(NSUInteger)d]];
+                rhsT = [g broadcastTensor:rhsT toShape:rhsExpandedShape name:nil];
+            }
+        }
+
         lhsT = [g reshapeTensor:lhsT withShape:@[ @(b), @(m), @(k) ] name:nil];
         rhsT = [g reshapeTensor:rhsT withShape:@[ @(b), @(k), @(n) ] name:nil];
         MPSGraphTensor* mm = [g matrixMultiplicationWithPrimaryTensor:lhsT secondaryTensor:rhsT name:nil];
@@ -213,7 +328,65 @@ static MPSGraphTensor* Handle_dot_general(MPSGraph* g, mlir::Operation* op, Valu
 
         NSArray<NSNumber*>* outputShape = GetOutputShape(op);
         if (outputShape) {
-            mm = [g reshapeTensor:mm withShape:outputShape name:nil];
+            auto vecToString = [](const std::vector<int64_t>& dims) -> std::string {
+                std::string s = "[";
+                for (size_t i = 0; i < dims.size(); ++i) {
+                    if (i)
+                        s += ",";
+                    s += std::to_string(dims[i]);
+                }
+                s += "]";
+                return s;
+            };
+            auto countElems = [](NSArray<NSNumber*>* shape) -> int64_t {
+                int64_t p = 1;
+                for (NSNumber* dim : shape)
+                    p *= [dim longLongValue];
+                return p;
+            };
+            auto canBroadcast = [](NSArray<NSNumber*>* inShape, NSArray<NSNumber*>* outShape) -> bool {
+                if (!inShape || !outShape || inShape.count != outShape.count)
+                    return false;
+                for (NSUInteger i = 0; i < outShape.count; ++i) {
+                    int64_t inDim = [inShape[i] longLongValue];
+                    int64_t outDim = [outShape[i] longLongValue];
+                    if (!(inDim == outDim || inDim == 1))
+                        return false;
+                }
+                return true;
+            };
+
+            NSArray<NSNumber*>* mmShape = mm.shape;
+            if (mmShape && countElems(mmShape) != countElems(outputShape) &&
+                canBroadcast(mmShape, outputShape)) {
+                MPS_LOG_WARN("dot_general: broadcasting matmul output %s -> %s\n",
+                             [[mmShape description] UTF8String],
+                             [[outputShape description] UTF8String]);
+                MPS_LOG_WARN(
+                    "dot_general dims lhsBatch=%s rhsBatch=%s lhsContract=%s rhsContract=%s\n",
+                    vecToString(lhsBatch).c_str(), vecToString(rhsBatch).c_str(),
+                    vecToString(lhsContract).c_str(), vecToString(rhsContract).c_str());
+                MPS_LOG_WARN("dot_general shapes lhs=%s rhs=%s out=%s\n",
+                             [[lhsShape description] UTF8String],
+                             [[rhsShape description] UTF8String],
+                             [[outputShape description] UTF8String]);
+                mm = [g broadcastTensor:mm toShape:outputShape name:nil];
+            } else {
+                if (mmShape && countElems(mmShape) != countElems(outputShape)) {
+                    MPS_LOG_ERROR("dot_general: incompatible reshape %s -> %s\n",
+                                  [[mmShape description] UTF8String],
+                                  [[outputShape description] UTF8String]);
+                    MPS_LOG_ERROR(
+                        "dot_general dims lhsBatch=%s rhsBatch=%s lhsContract=%s rhsContract=%s\n",
+                        vecToString(lhsBatch).c_str(), vecToString(rhsBatch).c_str(),
+                        vecToString(lhsContract).c_str(), vecToString(rhsContract).c_str());
+                    MPS_LOG_ERROR("dot_general shapes lhs=%s rhs=%s out=%s\n",
+                                  [[lhsShape description] UTF8String],
+                                  [[rhsShape description] UTF8String],
+                                  [[outputShape description] UTF8String]);
+                }
+                mm = [g reshapeTensor:mm withShape:outputShape name:nil];
+            }
         }
         return mm;
     }
