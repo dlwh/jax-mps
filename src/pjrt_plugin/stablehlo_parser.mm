@@ -33,6 +33,9 @@ const std::unordered_set<std::string>& getSupportedOps() {
         // Add control flow ops that don't need handlers
         ops.insert("func.return");
         ops.insert("func.call");
+        ops.insert("stablehlo.while");
+        ops.insert("stablehlo.case");
+        ops.insert("stablehlo.sort");
         return ops;
     }();
     return supported;
