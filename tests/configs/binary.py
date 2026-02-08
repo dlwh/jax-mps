@@ -131,4 +131,24 @@ def make_binary_op_configs():
                 numpy.random.standard_normal((3, 4)),
                 numpy.random.standard_normal((3, 4)),
             ),
+            OperationTestConfig(
+                lambda a, b: lax.dot_general(
+                    a,
+                    b,
+                    dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                ),
+                numpy.random.standard_normal((2, 3, 4)).astype(numpy.float32),
+                numpy.random.standard_normal((2, 4, 5)).astype(numpy.float32),
+                name="lax.dot_general-batched",
+            ),
+            OperationTestConfig(
+                lambda a, b: lax.dot_general(
+                    a,
+                    b,
+                    dimension_numbers=(((3,), (2,)), ((0, 2), (1, 0))),
+                ),
+                numpy.random.standard_normal((2, 4, 3, 5)).astype(numpy.float32),
+                numpy.random.standard_normal((3, 2, 5, 6)).astype(numpy.float32),
+                name="lax.dot_general-multi-batch-permuted",
+            ),
         ]
