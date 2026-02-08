@@ -479,10 +479,64 @@ static MPSGraphTensor* Handle_gather(MPSGraph* g, mlir::Operation* op, ValueMap&
         MPSGraphTensor* squeezedIndices = [g reshapeTensor:startIndices withShape:squeezedShape name:nil];
         squeezedIndices = EnsureInt32(g, squeezedIndices);
 
-        // Infer batch dimensions from shared leading dimensions before gatherAxis.
         NSUInteger batchDims = 0;
         NSArray<NSNumber*>* operandShape = operand.shape;
         NSArray<NSNumber*>* squeezedIndicesShape = squeezedIndices.shape;
+        if (operandShape.count == squeezedIndicesShape.count && operandShape.count >= 3) {
+            // Flatten non-gather dimensions into a batch axis to avoid MPSGraph gather shape bugs
+            // on high-rank batched selectors used by take_along_axis.
+            NSMutableArray<NSNumber*>* perm = [NSMutableArray array];
+            for (NSUInteger d = 0; d < operandShape.count; ++d) {
+                if ((int64_t)d != gatherAxis)
+                    [perm addObject:@(d)];
+            }
+            [perm addObject:@(gatherAxis)];
+
+            MPSGraphTensor* transposedOperand = [g transposeTensor:operand permutation:perm name:nil];
+            MPSGraphTensor* transposedIndices =
+                [g transposeTensor:squeezedIndices permutation:perm name:nil];
+
+            NSArray<NSNumber*>* transposedIndicesShape = transposedIndices.shape;
+            int64_t axisSize = [operandShape[(NSUInteger)gatherAxis] longLongValue];
+            int64_t indexCount =
+                [transposedIndicesShape[(NSUInteger)transposedIndicesShape.count - 1] longLongValue];
+            int64_t flatBatch = 1;
+            for (NSUInteger d = 0; d + 1 < transposedIndicesShape.count; ++d) {
+                flatBatch *= [transposedIndicesShape[d] longLongValue];
+            }
+
+            MPSGraphTensor* flatOperand =
+                [g reshapeTensor:transposedOperand withShape:@[ @(flatBatch), @(axisSize) ] name:nil];
+            MPSGraphTensor* flatIndices = [g reshapeTensor:transposedIndices
+                                                 withShape:@[ @(flatBatch), @(indexCount) ]
+                                                      name:nil];
+            flatIndices = EnsureInt32(g, flatIndices);
+
+            MPSGraphTensor* flatGathered = [g gatherWithUpdatesTensor:flatOperand
+                                                         indicesTensor:flatIndices
+                                                                  axis:1
+                                                       batchDimensions:1
+                                                                  name:nil];
+            MPSGraphTensor* gathered =
+                [g reshapeTensor:flatGathered withShape:transposedIndicesShape name:nil];
+
+            NSMutableArray<NSNumber*>* invPerm = [NSMutableArray array];
+            for (NSUInteger i = 0; i < perm.count; ++i)
+                [invPerm addObject:@0];
+            for (NSUInteger i = 0; i < perm.count; ++i) {
+                NSInteger p = [perm[i] integerValue];
+                invPerm[(NSUInteger)p] = @(i);
+            }
+            gathered = [g transposeTensor:gathered permutation:invPerm name:nil];
+
+            NSArray<NSNumber*>* outputShape = GetOutputShape(op);
+            if (outputShape) {
+                gathered = [g reshapeTensor:gathered withShape:outputShape name:nil];
+            }
+            return gathered;
+        }
+
+        // Infer batch dimensions from shared leading dimensions before gatherAxis.
         while (batchDims < (NSUInteger)gatherAxis && batchDims < operandShape.count &&
                batchDims < squeezedIndicesShape.count &&
                [operandShape[batchDims] integerValue] == [squeezedIndicesShape[batchDims] integerValue]) {

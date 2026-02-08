@@ -47,6 +47,13 @@ def make_slice_op_configs():
                 name="advanced_gather-new-axis",
             ),
             OperationTestConfig(
+                lambda x, idx: jnp.take_along_axis(x, idx, axis=2),
+                numpy.random.normal(size=(2, 3, 4, 5)).astype(numpy.float32),
+                numpy.random.randint(0, 4, size=(2, 3, 6, 5), dtype=numpy.int32),
+                differentiable_argnums=(),
+                name="take_along_axis-high-rank-batched",
+            ),
+            OperationTestConfig(
                 lambda x, idx, val: x.at[idx].set(val),
                 numpy.random.normal(size=(5, 3)),
                 numpy.array([0, 2]),
