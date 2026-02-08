@@ -27,6 +27,58 @@ static std::optional<int64_t> TryGetConstScalarInt(mlir::Value value) {
     return std::nullopt;
 }
 
+static int64_t ShapeNumElements(NSArray<NSNumber*>* shape) {
+    int64_t elems = 1;
+    for (NSNumber* dim : shape) {
+        elems *= [dim longLongValue];
+    }
+    return elems;
+}
+
+static bool IsBroadcastCompatible(NSArray<NSNumber*>* inputShape, NSArray<NSNumber*>* outputShape) {
+    if (!inputShape || !outputShape || inputShape.count != outputShape.count) {
+        return false;
+    }
+    for (NSUInteger i = 0; i < outputShape.count; ++i) {
+        int64_t inDim = [inputShape[i] longLongValue];
+        int64_t outDim = [outputShape[i] longLongValue];
+        if (!(inDim == outDim || inDim == 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool HasUnknownDim(NSArray<NSNumber*>* shape) {
+    if (!shape) {
+        return true;
+    }
+    for (NSNumber* dim : shape) {
+        if ([dim longLongValue] < 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static MPSGraphTensor* ReshapeOrBroadcastToShape(MPSGraph* g, MPSGraphTensor* input,
+                                                 NSArray<NSNumber*>* outputShape,
+                                                 const char* context) {
+    (void)context;
+    if (!input || !outputShape) {
+        return input;
+    }
+
+    NSArray<NSNumber*>* inputShape = input.shape;
+    if (inputShape && !HasUnknownDim(inputShape) && !HasUnknownDim(outputShape) &&
+        ShapeNumElements(inputShape) != ShapeNumElements(outputShape)) {
+        if (IsBroadcastCompatible(inputShape, outputShape)) {
+            return [g broadcastTensor:input toShape:outputShape name:nil];
+        }
+    }
+    return [g reshapeTensor:input withShape:outputShape name:nil];
+}
+
 static MPSGraphTensor* Handle_broadcast(MPSGraph* g, mlir::Operation* op, ValueMap& values) {
     MPSGraphTensor* input = GetInputTensor(values, op, 0);
     if (!input)
@@ -95,7 +147,7 @@ static MPSGraphTensor* Handle_reshape(MPSGraph* g, mlir::Operation* op, ValueMap
     if (!input)
         return nullptr;
     NSArray<NSNumber*>* outputShape = GetOutputShape(op);
-    return [g reshapeTensor:input withShape:outputShape name:nil];
+    return ReshapeOrBroadcastToShape(g, input, outputShape, "reshape");
 }
 REGISTER_MPS_OP("stablehlo.reshape", Handle_reshape);
 
@@ -459,6 +511,8 @@ static MPSGraphTensor* Handle_gather(MPSGraph* g, mlir::Operation* op, ValueMap&
     auto offsetDims = dimNumbers.getOffsetDims();
     auto collapsedSliceDims = dimNumbers.getCollapsedSliceDims();
     auto startIndexMap = dimNumbers.getStartIndexMap();
+    auto operandBatchingDims = dimNumbers.getOperandBatchingDims();
+    auto startIndicesBatchingDims = dimNumbers.getStartIndicesBatchingDims();
     int64_t indexVectorDim = dimNumbers.getIndexVectorDim();
     auto sliceSizes = gatherOp.getSliceSizes();
 
@@ -478,6 +532,64 @@ static MPSGraphTensor* Handle_gather(MPSGraph* g, mlir::Operation* op, ValueMap&
         }
         MPSGraphTensor* squeezedIndices = [g reshapeTensor:startIndices withShape:squeezedShape name:nil];
         squeezedIndices = EnsureInt32(g, squeezedIndices);
+
+        // Scalar selector (e.g. jnp.take(x, i, axis=...)) lowered by XLA to
+        // gather with indices shape [1] or [1,1]. Lower directly via dynamic
+        // slice to avoid gatherWithUpdates crashes on high-rank operands.
+        if (startIndexMap.size() == 1 && operandBatchingDims.empty() &&
+            startIndicesBatchingDims.empty()) {
+            NSArray<NSNumber*>* squeezedIndicesShape = squeezedIndices.shape;
+            bool isScalarIndex = squeezedIndicesShape.count == 0 ||
+                                 (squeezedIndicesShape.count == 1 &&
+                                  [squeezedIndicesShape[0] integerValue] == 1);
+            if (isScalarIndex) {
+                MPSGraphTensor* scalarIndex = squeezedIndices;
+                if (scalarIndex.shape.count == 0) {
+                    scalarIndex = [g reshapeTensor:scalarIndex withShape:@[ @1 ] name:nil];
+                }
+                MPSGraphTensor* zero =
+                    [g constantWithScalar:0 shape:@[ @1 ] dataType:MPSDataTypeInt32];
+
+                NSMutableArray<MPSGraphTensor*>* startParts =
+                    [NSMutableArray arrayWithCapacity:operand.shape.count];
+                for (NSUInteger d = 0; d < operand.shape.count; ++d) {
+                    if ((int64_t)d == gatherAxis) {
+                        [startParts addObject:scalarIndex];
+                    } else {
+                        [startParts addObject:zero];
+                    }
+                }
+                MPSGraphTensor* startVec = [g concatTensors:startParts dimension:0 name:nil];
+
+                NSMutableArray<MPSGraphTensor*>* sizeParts =
+                    [NSMutableArray arrayWithCapacity:sliceSizes.size()];
+                for (int64_t sz : sliceSizes) {
+                    [sizeParts addObject:[g constantWithScalar:sz
+                                                         shape:@[ @1 ]
+                                                      dataType:MPSDataTypeInt32]];
+                }
+                MPSGraphTensor* sizeVec = [g concatTensors:sizeParts dimension:0 name:nil];
+
+                NSUInteger squeezeMask = 0;
+                for (int64_t dim : collapsedSliceDims) {
+                    if (dim >= 0 && dim < 63) {
+                        squeezeMask |= (1ULL << (NSUInteger)dim);
+                    }
+                }
+
+                MPSGraphTensor* sliced = [g sliceTensor:operand
+                                            startTensor:startVec
+                                             sizeTensor:sizeVec
+                                            squeezeMask:squeezeMask
+                                                   name:nil];
+                NSArray<NSNumber*>* outputShape = GetOutputShape(op);
+                if (outputShape) {
+                    sliced =
+                        ReshapeOrBroadcastToShape(g, sliced, outputShape, "gather-scalar-dynamic-slice");
+                }
+                return sliced;
+            }
+        }
 
         NSUInteger batchDims = 0;
         NSArray<NSNumber*>* operandShape = operand.shape;
