@@ -142,9 +142,49 @@ def make_binary_op_configs():
                 name="lax.dot_general-batched",
             ),
             OperationTestConfig(
+                lambda a, b: lax.dot_general(
+                    a,
+                    b,
+                    dimension_numbers=(((3,), (2,)), ((0, 2), (1, 0))),
+                ),
+                numpy.random.standard_normal((2, 4, 3, 5)).astype(numpy.float32),
+                numpy.random.standard_normal((3, 2, 5, 6)).astype(numpy.float32),
+                name="lax.dot_general-multi-batch-permuted",
+            ),
+            OperationTestConfig(
+                jnp.bitwise_and,
+                numpy.array([0, 1, 3, 7, 15], dtype=numpy.int32),
+                numpy.array([1, 3, 7, 15, 31], dtype=numpy.int32),
+                differentiable_argnums=(),
+            ),
+            OperationTestConfig(
+                jnp.bitwise_xor,
+                numpy.array([0, 1, 3, 7, 15], dtype=numpy.int32),
+                numpy.array([1, 3, 7, 15, 31], dtype=numpy.int32),
+                differentiable_argnums=(),
+            ),
+            OperationTestConfig(
+                jnp.logical_and,
+                numpy.array([True, False, True, False]),
+                numpy.array([True, True, False, False]),
+                differentiable_argnums=(),
+            ),
+            OperationTestConfig(
+                lax.shift_left,
+                numpy.array([1, 2, 4, 8], dtype=numpy.int32),
+                numpy.array([0, 1, 2, 3], dtype=numpy.int32),
+                differentiable_argnums=(),
+            ),
+            OperationTestConfig(
                 jnp.right_shift,
                 numpy.array([-8, -1, 8, 127], dtype=numpy.int32),
                 numpy.array([1, 31, 2, 40], dtype=numpy.int32),
+                differentiable_argnums=(),
+            ),
+            OperationTestConfig(
+                lax.shift_right_logical,
+                numpy.array([1, 2, 4, 8, 0x80000000], dtype=numpy.uint32),
+                numpy.array([0, 1, 2, 3, 31], dtype=numpy.uint32),
                 differentiable_argnums=(),
             ),
         ]
