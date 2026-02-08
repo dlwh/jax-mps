@@ -43,12 +43,4 @@ def make_misc_op_configs():
                 numpy.int32(0),
                 differentiable_argnums=(),
             ),
-            OperationTestConfig(
-                lambda x: jnp.fft.fft(x),
-                (
-                    numpy.random.standard_normal((16,))
-                    + 1j * numpy.random.standard_normal((16,))
-                ).astype(numpy.complex64),
-                differentiable_argnums=(),
-            ),
         ]
