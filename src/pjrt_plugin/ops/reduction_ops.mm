@@ -430,22 +430,59 @@ static SelectScatterKind GetSelectScatterKind(mlir::Region& selectRegion) {
     if (selectRegion.empty()) {
         return SelectScatterKind::kUnknown;
     }
-    for (mlir::Operation& nestedOp : selectRegion.front()) {
-        auto compareOp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(&nestedOp);
-        if (!compareOp) {
+    mlir::Block& block = selectRegion.front();
+    if (block.getNumArguments() != 2) {
+        return SelectScatterKind::kUnknown;
+    }
+
+    mlir::stablehlo::CompareOp compareOp = nullptr;
+    mlir::stablehlo::ReturnOp returnOp = nullptr;
+    for (mlir::Operation& nestedOp : block) {
+        if (auto cmp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(&nestedOp)) {
+            if (compareOp) {
+                return SelectScatterKind::kUnknown;
+            }
+            compareOp = cmp;
             continue;
         }
-        auto dir = compareOp.getComparisonDirection();
-        if (dir == mlir::stablehlo::ComparisonDirection::GE ||
-            dir == mlir::stablehlo::ComparisonDirection::GT) {
-            return SelectScatterKind::kMax;
+        if (auto ret = mlir::dyn_cast<mlir::stablehlo::ReturnOp>(&nestedOp)) {
+            if (returnOp) {
+                return SelectScatterKind::kUnknown;
+            }
+            returnOp = ret;
+            continue;
         }
-        if (dir == mlir::stablehlo::ComparisonDirection::LE ||
-            dir == mlir::stablehlo::ComparisonDirection::LT) {
-            return SelectScatterKind::kMin;
-        }
+        // Only support the canonical comparator body:
+        // %pred = stablehlo.compare %arg0, %arg1; stablehlo.return %pred
+        return SelectScatterKind::kUnknown;
     }
-    return SelectScatterKind::kUnknown;
+
+    if (!compareOp || !returnOp || returnOp.getNumOperands() != 1 ||
+        returnOp.getOperand(0) != compareOp.getResult()) {
+        return SelectScatterKind::kUnknown;
+    }
+
+    mlir::Value arg0 = block.getArgument(0);
+    mlir::Value arg1 = block.getArgument(1);
+    mlir::Value lhs = compareOp.getOperand(0);
+    mlir::Value rhs = compareOp.getOperand(1);
+    bool directOrder = (lhs == arg0 && rhs == arg1);
+    bool reversedOrder = (lhs == arg1 && rhs == arg0);
+    if (!directOrder && !reversedOrder) {
+        return SelectScatterKind::kUnknown;
+    }
+
+    auto dir = compareOp.getComparisonDirection();
+    switch (dir) {
+        case mlir::stablehlo::ComparisonDirection::GT:
+        case mlir::stablehlo::ComparisonDirection::GE:
+            return directOrder ? SelectScatterKind::kMax : SelectScatterKind::kMin;
+        case mlir::stablehlo::ComparisonDirection::LT:
+        case mlir::stablehlo::ComparisonDirection::LE:
+            return directOrder ? SelectScatterKind::kMin : SelectScatterKind::kMax;
+        default:
+            return SelectScatterKind::kUnknown;
+    }
 }
 
 static MPSGraphTensor* Handle_select_and_scatter(MPSGraph* g, mlir::Operation* op,
