@@ -52,6 +52,19 @@ def make_reduction_op_configs():
                     differentiable_argnums=(),
                 ),
                 OperationTestConfig(
+                    lambda x: lax.reduce_window(
+                        x,
+                        0.0,
+                        lax.add,
+                        window_dimensions=(1, 2, 3, 1),
+                        window_strides=(1, 2, 2, 1),
+                        padding=((0, 0), (1, 0), (0, 1), (0, 0)),
+                    ),
+                    numpy.random.standard_normal((2, 5, 6, 3)).astype(numpy.float32),
+                    differentiable_argnums=(),
+                    name="lax.reduce_window-add-pooling-style",
+                ),
+                OperationTestConfig(
                     lambda x: jnp.sum(
                         lax.reduce_window(
                             x,
@@ -64,5 +77,33 @@ def make_reduction_op_configs():
                     ),
                     numpy.random.standard_normal((1, 6, 6, 1)).astype(numpy.float32),
                     name="lax.reduce_window-max-grad-path",
+                ),
+                OperationTestConfig(
+                    lambda x: jnp.sum(
+                        lax.reduce_window(
+                            x,
+                            jnp.inf,
+                            lax.min,
+                            window_dimensions=(1, 2, 2, 1),
+                            window_strides=(1, 2, 2, 1),
+                            padding=((0, 0), (0, 0), (0, 0), (0, 0)),
+                        )
+                    ),
+                    numpy.random.standard_normal((1, 6, 6, 1)).astype(numpy.float32),
+                    name="lax.reduce_window-min-grad-path",
+                ),
+                OperationTestConfig(
+                    lambda x: jnp.sum(
+                        lax.reduce_window(
+                            x,
+                            -jnp.inf,
+                            lax.max,
+                            window_dimensions=(1, 2, 2, 2, 1),
+                            window_strides=(1, 1, 2, 2, 1),
+                            padding=((0, 0), (0, 0), (0, 0), (0, 0), (0, 0)),
+                        )
+                    ),
+                    numpy.random.standard_normal((1, 4, 6, 6, 1)).astype(numpy.float32),
+                    name="lax.reduce_window-max-grad-path-3d",
                 ),
             ]
