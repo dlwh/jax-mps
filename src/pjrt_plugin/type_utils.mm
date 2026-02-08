@@ -71,6 +71,13 @@ int MpsToPjrtDtype(MPSDataType mps_type) {
 }
 
 MPSDataType MlirTypeToMps(mlir::Type type) {
+    if (auto floatType = mlir::dyn_cast<mlir::FloatType>(type)) {
+        // MPSGraph does not expose float8 datatypes. Use float16 as a best-effort
+        // approximation for float8 tensors.
+        if (floatType.getWidth() == 8)
+            return MPSDataTypeFloat16;
+    }
+
     if (type.isF32())
         return MPSDataTypeFloat32;
     if (type.isF16())

@@ -5,6 +5,11 @@
 
 namespace jax_mps {
 
+static bool IsMatmulSupportedType(MPSDataType t) {
+    return t == MPSDataTypeFloat16 || t == MPSDataTypeFloat32 || t == MPSDataTypeBFloat16 ||
+           t == MPSDataTypeComplexFloat16 || t == MPSDataTypeComplexFloat32;
+}
+
 REGISTER_MLIR_BINARY_OP("stablehlo.add", addition, add);
 REGISTER_MLIR_BINARY_OP("stablehlo.subtract", subtraction, subtract);
 REGISTER_MLIR_BINARY_OP("stablehlo.multiply", multiplication, multiply);
@@ -21,7 +26,19 @@ static MPSGraphTensor* Handle_dot(MPSGraph* g, mlir::Operation* op, ValueMap& va
     MPSGraphTensor* rhs = GetInputTensor(values, op, 1);
     if (!lhs || !rhs)
         return nullptr;
-    return [g matrixMultiplicationWithPrimaryTensor:lhs secondaryTensor:rhs name:nil];
+
+    MPSDataType outType = GetResultMpsType(op);
+    if (!IsMatmulSupportedType(lhs.dataType)) {
+        lhs = [g castTensor:lhs toType:MPSDataTypeFloat16 name:nil];
+    }
+    if (!IsMatmulSupportedType(rhs.dataType)) {
+        rhs = [g castTensor:rhs toType:MPSDataTypeFloat16 name:nil];
+    }
+    MPSGraphTensor* mm = [g matrixMultiplicationWithPrimaryTensor:lhs secondaryTensor:rhs name:nil];
+    if (outType != MPSDataTypeInvalid && mm.dataType != outType) {
+        mm = [g castTensor:mm toType:outType name:nil];
+    }
+    return mm;
 }
 static bool _reg_dot = ::jax_mps::OpRegistry::Register("stablehlo.dot", Handle_dot);
 
@@ -38,6 +55,13 @@ static MPSGraphTensor* Handle_dot_general(MPSGraph* g, mlir::Operation* op, Valu
     MPSGraphTensor* rhs = GetInputTensor(values, op, 1);
     if (!lhs || !rhs)
         return nullptr;
+    MPSDataType outType = GetResultMpsType(op);
+    if (!IsMatmulSupportedType(lhs.dataType)) {
+        lhs = [g castTensor:lhs toType:MPSDataTypeFloat16 name:nil];
+    }
+    if (!IsMatmulSupportedType(rhs.dataType)) {
+        rhs = [g castTensor:rhs toType:MPSDataTypeFloat16 name:nil];
+    }
 
     auto dimNumbers = dotOp.getDotDimensionNumbers();
     auto lhsContractingDims = dimNumbers.getLhsContractingDimensions();
@@ -59,7 +83,11 @@ static MPSGraphTensor* Handle_dot_general(MPSGraph* g, mlir::Operation* op, Valu
 
         // Standard matmul: LHS contracts on dim 1, RHS contracts on dim 0
         if (lhsContractDim == 1 && rhsContractDim == 0) {
-            return [g matrixMultiplicationWithPrimaryTensor:lhs secondaryTensor:rhs name:nil];
+            MPSGraphTensor* mm = [g matrixMultiplicationWithPrimaryTensor:lhs secondaryTensor:rhs name:nil];
+            if (outType != MPSDataTypeInvalid && mm.dataType != outType) {
+                mm = [g castTensor:mm toType:outType name:nil];
+            }
+            return mm;
         }
 
         // LHS contracts on dim 0: need to transpose LHS
@@ -70,7 +98,11 @@ static MPSGraphTensor* Handle_dot_general(MPSGraph* g, mlir::Operation* op, Valu
             // RHS is (K, N)
             // (M, K) @ (K, N) = (M, N)
             MPSGraphTensor* lhsT = [g transposeTensor:lhs permutation:@[@1, @0] name:nil];
-            return [g matrixMultiplicationWithPrimaryTensor:lhsT secondaryTensor:rhs name:nil];
+            MPSGraphTensor* mm = [g matrixMultiplicationWithPrimaryTensor:lhsT secondaryTensor:rhs name:nil];
+            if (outType != MPSDataTypeInvalid && mm.dataType != outType) {
+                mm = [g castTensor:mm toType:outType name:nil];
+            }
+            return mm;
         }
 
         // LHS contracts on dim 1, RHS contracts on dim 1: need to transpose RHS
@@ -78,7 +110,11 @@ static MPSGraphTensor* Handle_dot_general(MPSGraph* g, mlir::Operation* op, Valu
             // LHS is (M, K), RHS is (N, K), RHS^T is (K, N)
             // (M, K) @ (K, N) = (M, N)
             MPSGraphTensor* rhsT = [g transposeTensor:rhs permutation:@[@1, @0] name:nil];
-            return [g matrixMultiplicationWithPrimaryTensor:lhs secondaryTensor:rhsT name:nil];
+            MPSGraphTensor* mm = [g matrixMultiplicationWithPrimaryTensor:lhs secondaryTensor:rhsT name:nil];
+            if (outType != MPSDataTypeInvalid && mm.dataType != outType) {
+                mm = [g castTensor:mm toType:outType name:nil];
+            }
+            return mm;
         }
 
         // LHS contracts on dim 0, RHS contracts on dim 1: transpose both
@@ -88,11 +124,97 @@ static MPSGraphTensor* Handle_dot_general(MPSGraph* g, mlir::Operation* op, Valu
             // (M, K) @ (K, N) = (M, N)
             MPSGraphTensor* lhsT = [g transposeTensor:lhs permutation:@[@1, @0] name:nil];
             MPSGraphTensor* rhsT = [g transposeTensor:rhs permutation:@[@1, @0] name:nil];
-            return [g matrixMultiplicationWithPrimaryTensor:lhsT secondaryTensor:rhsT name:nil];
+            MPSGraphTensor* mm = [g matrixMultiplicationWithPrimaryTensor:lhsT secondaryTensor:rhsT name:nil];
+            if (outType != MPSDataTypeInvalid && mm.dataType != outType) {
+                mm = [g castTensor:mm toType:outType name:nil];
+            }
+            return mm;
         }
     }
 
-    // Fall back to simple matmul for unhandled cases
+    // General dot_general lowering:
+    // transpose to [batch..., lhs_out..., contract...] and
+    // [batch..., contract..., rhs_out...], then reshape to batched matmul.
+    if (lhsBatchDims.size() == rhsBatchDims.size()) {
+        std::vector<int64_t> lhsBatch(lhsBatchDims.begin(), lhsBatchDims.end());
+        std::vector<int64_t> rhsBatch(rhsBatchDims.begin(), rhsBatchDims.end());
+        std::vector<int64_t> lhsContract(lhsContractingDims.begin(), lhsContractingDims.end());
+        std::vector<int64_t> rhsContract(rhsContractingDims.begin(), rhsContractingDims.end());
+        std::vector<bool> lhsIsContract(lhsRank, false), rhsIsContract(rhsRank, false);
+        std::vector<bool> lhsIsBatch(lhsRank, false), rhsIsBatch(rhsRank, false);
+        for (int64_t d : lhsContract)
+            lhsIsContract[d] = true;
+        for (int64_t d : rhsContract)
+            rhsIsContract[d] = true;
+        for (int64_t d : lhsBatch)
+            lhsIsBatch[d] = true;
+        for (int64_t d : rhsBatch)
+            rhsIsBatch[d] = true;
+
+        std::vector<int64_t> lhsNonContract, rhsNonContract;
+        lhsNonContract.reserve(lhsRank);
+        rhsNonContract.reserve(rhsRank);
+        for (NSUInteger i = 0; i < lhsRank; ++i) {
+            if (!lhsIsContract[i] && !lhsIsBatch[i])
+                lhsNonContract.push_back((int64_t)i);
+        }
+        for (NSUInteger i = 0; i < rhsRank; ++i) {
+            if (!rhsIsContract[i] && !rhsIsBatch[i])
+                rhsNonContract.push_back((int64_t)i);
+        }
+
+        auto product = [](NSArray<NSNumber*>* shape, const std::vector<int64_t>& dims) -> int64_t {
+            int64_t p = 1;
+            for (int64_t d : dims)
+                p *= [shape[(NSUInteger)d] longLongValue];
+            return p;
+        };
+
+        int64_t b = lhsBatch.empty() ? 1 : product(lhsShape, lhsBatch);
+        int64_t m = lhsNonContract.empty() ? 1 : product(lhsShape, lhsNonContract);
+        int64_t k = lhsContract.empty() ? 1 : product(lhsShape, lhsContract);
+        int64_t n = rhsNonContract.empty() ? 1 : product(rhsShape, rhsNonContract);
+
+        NSMutableArray<NSNumber*>* lhsPerm = [NSMutableArray array];
+        for (int64_t d : lhsBatch)
+            [lhsPerm addObject:@(d)];
+        for (int64_t d : lhsNonContract)
+            [lhsPerm addObject:@(d)];
+        for (int64_t d : lhsContract)
+            [lhsPerm addObject:@(d)];
+
+        NSMutableArray<NSNumber*>* rhsPerm = [NSMutableArray array];
+        for (int64_t d : rhsBatch)
+            [rhsPerm addObject:@(d)];
+        for (int64_t d : rhsContract)
+            [rhsPerm addObject:@(d)];
+        for (int64_t d : rhsNonContract)
+            [rhsPerm addObject:@(d)];
+
+        MPSGraphTensor* lhsT = lhs;
+        MPSGraphTensor* rhsT = rhs;
+        if (lhsPerm.count > 0) {
+            lhsT = [g transposeTensor:lhs permutation:lhsPerm name:nil];
+        }
+        if (rhsPerm.count > 0) {
+            rhsT = [g transposeTensor:rhs permutation:rhsPerm name:nil];
+        }
+
+        lhsT = [g reshapeTensor:lhsT withShape:@[ @(b), @(m), @(k) ] name:nil];
+        rhsT = [g reshapeTensor:rhsT withShape:@[ @(b), @(k), @(n) ] name:nil];
+        MPSGraphTensor* mm = [g matrixMultiplicationWithPrimaryTensor:lhsT secondaryTensor:rhsT name:nil];
+        if (outType != MPSDataTypeInvalid && mm.dataType != outType) {
+            mm = [g castTensor:mm toType:outType name:nil];
+        }
+
+        NSArray<NSNumber*>* outputShape = GetOutputShape(op);
+        if (outputShape) {
+            mm = [g reshapeTensor:mm withShape:outputShape name:nil];
+        }
+        return mm;
+    }
+
+    // Fall back to simple matmul for unhandled batch cases
     MPS_LOG_WARN("dot_general with complex contracting/batch dims, falling back to simple matmul. "
                  "LHS contracting: %lld, RHS contracting: %lld\n",
                  lhsContractingDims.empty() ? -1 : lhsContractingDims[0],
