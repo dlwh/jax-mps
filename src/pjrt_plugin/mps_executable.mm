@@ -18,6 +18,7 @@
 #import "pjrt_plugin/mps_device.h"
 #import "pjrt_plugin/ops/registry.h"
 #import "pjrt_plugin/stablehlo_parser.h"
+#include "llvm/Support/raw_ostream.h"
 
 namespace jax_mps {
 
@@ -84,9 +85,52 @@ struct ProcessResult {
     }
 };
 
+struct LoweringContext {
+    // CSE caches for frequently repeated pointwise scaffolding ops.
+    std::unordered_map<std::string, MPSGraphTensor*> constant_cache;
+    std::unordered_map<std::string, MPSGraphTensor*> broadcast_in_dim_cache;
+};
+
 // Forward declaration for recursive processing
 static ProcessResult processOperations(MPSGraph* graph, mlir::Block& block, ValueMap& values,
-                                       mlir::ModuleOp module, int depth);
+                                       mlir::ModuleOp module, int depth,
+                                       LoweringContext& context);
+
+static std::string AttrToString(mlir::Attribute attr) {
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    attr.print(os);
+    return os.str();
+}
+
+static std::string TypeToString(mlir::Type type) {
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    type.print(os);
+    return os.str();
+}
+
+static std::string ConstantCseKey(mlir::Operation* op) {
+    mlir::Attribute value_attr = op->getAttr("value");
+    if (!value_attr || op->getNumResults() != 1) {
+        return "";
+    }
+    return std::string("const|") + TypeToString(op->getResult(0).getType()) + "|" +
+           AttrToString(value_attr);
+}
+
+static std::string BroadcastInDimCseKey(mlir::Operation* op) {
+    if (op->getNumResults() != 1 || op->getNumOperands() != 1) {
+        return "";
+    }
+    mlir::Attribute dims_attr = op->getAttr("broadcast_dimensions");
+    if (!dims_attr) {
+        return "";
+    }
+    return std::string("broadcast_in_dim|") +
+           std::to_string(reinterpret_cast<uintptr_t>(op->getOperand(0).getAsOpaquePointer())) +
+           "|" + TypeToString(op->getResult(0).getType()) + "|" + AttrToString(dims_attr);
+}
 
 struct FusionOpportunityStats {
     size_t total_ops = 0;
@@ -188,7 +232,8 @@ static std::string TopOpsSummary(const std::unordered_map<std::string, size_t>& 
 
 // Process a func.call operation by looking up the callee and processing its body
 static ProcessResult processCallOp(MPSGraph* graph, mlir::func::CallOp callOp, ValueMap& values,
-                                   mlir::ModuleOp module, int depth) {
+                                   mlir::ModuleOp module, int depth,
+                                   LoweringContext& context) {
     if (depth > 100) {
         return ProcessResult::Error("Maximum call depth exceeded - possible recursive function");
     }
@@ -221,7 +266,8 @@ static ProcessResult processCallOp(MPSGraph* graph, mlir::func::CallOp callOp, V
     }
 
     // Process the callee function's body
-    ProcessResult calleeResult = processOperations(graph, calleeBlock, values, module, depth + 1);
+    ProcessResult calleeResult =
+        processOperations(graph, calleeBlock, values, module, depth + 1, context);
     if (!calleeResult.ok()) {
         return calleeResult;
     }
@@ -242,7 +288,8 @@ static ProcessResult processCallOp(MPSGraph* graph, mlir::func::CallOp callOp, V
 
 // Process operations in a block, handling func.call recursively
 static ProcessResult processOperations(MPSGraph* graph, mlir::Block& block, ValueMap& values,
-                                       mlir::ModuleOp module, int depth) {
+                                       mlir::ModuleOp module, int depth,
+                                       LoweringContext& context) {
     ProcessResult result;
 
     if (depth == 0 && ShouldLogFusionStats()) {
@@ -272,11 +319,33 @@ static ProcessResult processOperations(MPSGraph* graph, mlir::Block& block, Valu
 
         // Handle func.call - process the callee function recursively
         if (auto callOp = mlir::dyn_cast<mlir::func::CallOp>(op)) {
-            ProcessResult callResult = processCallOp(graph, callOp, values, module, depth);
+            ProcessResult callResult =
+                processCallOp(graph, callOp, values, module, depth, context);
             if (!callResult.ok()) {
                 return callResult;
             }
             continue;
+        }
+
+        if (op_name == "stablehlo.constant" && op->getNumResults() == 1) {
+            std::string key = ConstantCseKey(op);
+            if (!key.empty()) {
+                auto it = context.constant_cache.find(key);
+                if (it != context.constant_cache.end()) {
+                    values[op->getResult(0).getAsOpaquePointer()] = it->second;
+                    continue;
+                }
+            }
+        }
+        if (op_name == "stablehlo.broadcast_in_dim" && op->getNumResults() == 1) {
+            std::string key = BroadcastInDimCseKey(op);
+            if (!key.empty()) {
+                auto it = context.broadcast_in_dim_cache.find(key);
+                if (it != context.broadcast_in_dim_cache.end()) {
+                    values[op->getResult(0).getAsOpaquePointer()] = it->second;
+                    continue;
+                }
+            }
         }
 
         // Look up handler in registry
@@ -303,6 +372,18 @@ static ProcessResult processOperations(MPSGraph* graph, mlir::Block& block, Valu
         // Map the result to the output tensor
         if (op->getNumResults() > 0) {
             values[op->getResult(0).getAsOpaquePointer()] = out;
+
+            if (op_name == "stablehlo.constant") {
+                std::string key = ConstantCseKey(op);
+                if (!key.empty()) {
+                    context.constant_cache[key] = out;
+                }
+            } else if (op_name == "stablehlo.broadcast_in_dim") {
+                std::string key = BroadcastInDimCseKey(op);
+                if (!key.empty()) {
+                    context.broadcast_in_dim_cache[key] = out;
+                }
+            }
         }
     }
 
@@ -359,9 +440,10 @@ bool MpsExecutable::BuildGraph() {
 
         // Process operations to build the graph
         ProcessResult processResult;
+        LoweringContext loweringContext;
         @try {
             mlir::Block& entryBlock = entry_func_.front();
-            processResult = processOperations(graph, entryBlock, values, *module_, 0);
+            processResult = processOperations(graph, entryBlock, values, *module_, 0, loweringContext);
         } @catch (NSException* exception) {
             error_ = "MPS graph build failed: " + std::string([[exception reason] UTF8String]);
             return false;
