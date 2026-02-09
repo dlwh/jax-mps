@@ -519,7 +519,13 @@ static MPSGraphTensor* Handle_gather(MPSGraph* g, mlir::Operation* op, ValueMap&
     NSArray<NSNumber*>* indicesShape = startIndices.shape;
     NSUInteger indicesRank = indicesShape.count;
 
-    // Single-axis gather pattern used by take/take_along_axis variants.
+    // Handle common embedding lookup pattern (and equivalent single-axis gathers):
+    // operand: [num_embeddings, embedding_dim] in the classic case
+    // indices: [batch..., 1] where the trailing dim is the index vector
+    // offset_dims: slice/output dims (for embeddings this is [last_dim])
+    // collapsed_slice_dims: gathered axis (for embeddings this is [0])
+    // start_index_map: gathered axis per index component (for embeddings this is [0])
+    // index_vector_dim: required to be the last indices dimension in this lowering
     if (indexVectorDim == (int64_t)indicesRank - 1 &&
         [indicesShape[indicesRank - 1] integerValue] == 1 && startIndexMap.size() == 1 &&
         collapsedSliceDims.size() == 1 && collapsedSliceDims[0] == startIndexMap[0]) {
