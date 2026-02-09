@@ -2,8 +2,82 @@
 // custom_call, etc.
 
 #import "pjrt_plugin/ops/registry.h"
+#include <optional>
 
 namespace jax_mps {
+
+static std::optional<int64_t> TryGetConstScalarInt(mlir::Value value) {
+    if (auto cstOp = value.getDefiningOp<mlir::stablehlo::ConstantOp>()) {
+        auto dense = mlir::dyn_cast<mlir::DenseIntElementsAttr>(cstOp.getValue());
+        if (dense && dense.getNumElements() == 1) {
+            auto it = dense.getValues<llvm::APInt>().begin();
+            return (*it).getSExtValue();
+        }
+        return std::nullopt;
+    }
+    if (auto broadcastOp = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
+        return TryGetConstScalarInt(broadcastOp.getOperand());
+    }
+    if (auto reshapeOp = value.getDefiningOp<mlir::stablehlo::ReshapeOp>()) {
+        return TryGetConstScalarInt(reshapeOp.getOperand());
+    }
+    if (auto convertOp = value.getDefiningOp<mlir::stablehlo::ConvertOp>()) {
+        return TryGetConstScalarInt(convertOp.getOperand());
+    }
+    return std::nullopt;
+}
+
+static int64_t ShapeNumElements(NSArray<NSNumber*>* shape) {
+    int64_t elems = 1;
+    for (NSNumber* dim : shape) {
+        elems *= [dim longLongValue];
+    }
+    return elems;
+}
+
+static bool IsBroadcastCompatible(NSArray<NSNumber*>* inputShape, NSArray<NSNumber*>* outputShape) {
+    if (!inputShape || !outputShape || inputShape.count != outputShape.count) {
+        return false;
+    }
+    for (NSUInteger i = 0; i < outputShape.count; ++i) {
+        int64_t inDim = [inputShape[i] longLongValue];
+        int64_t outDim = [outputShape[i] longLongValue];
+        if (!(inDim == outDim || inDim == 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool HasUnknownDim(NSArray<NSNumber*>* shape) {
+    if (!shape) {
+        return true;
+    }
+    for (NSNumber* dim : shape) {
+        if ([dim longLongValue] < 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static MPSGraphTensor* ReshapeOrBroadcastToShape(MPSGraph* g, MPSGraphTensor* input,
+                                                 NSArray<NSNumber*>* outputShape,
+                                                 const char* context) {
+    (void)context;
+    if (!input || !outputShape) {
+        return input;
+    }
+
+    NSArray<NSNumber*>* inputShape = input.shape;
+    if (inputShape && !HasUnknownDim(inputShape) && !HasUnknownDim(outputShape) &&
+        ShapeNumElements(inputShape) != ShapeNumElements(outputShape)) {
+        if (IsBroadcastCompatible(inputShape, outputShape)) {
+            return [g broadcastTensor:input toShape:outputShape name:nil];
+        }
+    }
+    return [g reshapeTensor:input withShape:outputShape name:nil];
+}
 
 static MPSGraphTensor* Handle_broadcast(MPSGraph* g, mlir::Operation* op, ValueMap& values) {
     MPSGraphTensor* input = GetInputTensor(values, op, 0);
@@ -73,7 +147,7 @@ static MPSGraphTensor* Handle_reshape(MPSGraph* g, mlir::Operation* op, ValueMap
     if (!input)
         return nullptr;
     NSArray<NSNumber*>* outputShape = GetOutputShape(op);
-    return [g reshapeTensor:input withShape:outputShape name:nil];
+    return ReshapeOrBroadcastToShape(g, input, outputShape, "reshape");
 }
 REGISTER_MPS_OP("stablehlo.reshape", Handle_reshape);
 
@@ -437,51 +511,292 @@ static MPSGraphTensor* Handle_gather(MPSGraph* g, mlir::Operation* op, ValueMap&
     auto offsetDims = dimNumbers.getOffsetDims();
     auto collapsedSliceDims = dimNumbers.getCollapsedSliceDims();
     auto startIndexMap = dimNumbers.getStartIndexMap();
+    auto operandBatchingDims = dimNumbers.getOperandBatchingDims();
+    auto startIndicesBatchingDims = dimNumbers.getStartIndicesBatchingDims();
     int64_t indexVectorDim = dimNumbers.getIndexVectorDim();
     auto sliceSizes = gatherOp.getSliceSizes();
-
-    // Handle common embedding lookup pattern:
-    // operand: [num_embeddings, embedding_dim]
-    // indices: [batch..., 1] where the last dim is the index vector
-    // offset_dims: [last_dim] - the embedding dimension
-    // collapsed_slice_dims: [0] - the looked-up dimension
-    // start_index_map: [0] - indices point into dim 0
 
     NSArray<NSNumber*>* indicesShape = startIndices.shape;
     NSUInteger indicesRank = indicesShape.count;
 
-    // Check if index_vector_dim is the last dimension and has size 1
-    // This is the common embedding pattern
+    // Handle common embedding lookup pattern (and equivalent single-axis gathers):
+    // operand: [num_embeddings, embedding_dim] in the classic case
+    // indices: [batch..., 1] where the trailing dim is the index vector
+    // offset_dims: slice/output dims (for embeddings this is [last_dim])
+    // collapsed_slice_dims: gathered axis (for embeddings this is [0])
+    // start_index_map: gathered axis per index component (for embeddings this is [0])
+    // index_vector_dim: required to be the last indices dimension in this lowering
     if (indexVectorDim == (int64_t)indicesRank - 1 &&
         [indicesShape[indicesRank - 1] integerValue] == 1 && startIndexMap.size() == 1 &&
         collapsedSliceDims.size() == 1 && collapsedSliceDims[0] == startIndexMap[0]) {
         int64_t gatherAxis = startIndexMap[0];
 
-        // Squeeze the index vector dimension from indices
         // [batch..., 1] -> [batch...]
         NSMutableArray<NSNumber*>* squeezedShape = [NSMutableArray array];
         for (NSUInteger i = 0; i < indicesRank - 1; i++) {
             [squeezedShape addObject:indicesShape[i]];
         }
-
-        MPSGraphTensor* squeezedIndices = [g reshapeTensor:startIndices
-                                                 withShape:squeezedShape
-                                                      name:nil];
-
-        // Cast indices to int32 if needed (MPS gather requires int32)
+        MPSGraphTensor* squeezedIndices = [g reshapeTensor:startIndices withShape:squeezedShape name:nil];
         squeezedIndices = EnsureInt32(g, squeezedIndices);
 
-        // Use gatherWithUpdatesTensor:indicesTensor:axis:batchDimensions:
-        // This gathers slices from operand along the specified axis using indices
-        // Result shape: indices.shape + operand.shape[axis+1:]
-        // For embedding [100, 5] with indices [3]: result is [3, 5]
-        MPSGraphTensor* result = [g gatherWithUpdatesTensor:operand
-                                              indicesTensor:squeezedIndices
-                                                       axis:(NSUInteger)gatherAxis
-                                            batchDimensions:0
-                                                       name:nil];
+        // Scalar selector (e.g. jnp.take(x, i, axis=...)) lowered by XLA to
+        // gather with indices shape [1] or [1,1]. Lower directly via dynamic
+        // slice to avoid gatherWithUpdates crashes on high-rank operands.
+        if (startIndexMap.size() == 1 && operandBatchingDims.empty() &&
+            startIndicesBatchingDims.empty()) {
+            NSArray<NSNumber*>* squeezedIndicesShape = squeezedIndices.shape;
+            bool isScalarIndex = squeezedIndicesShape.count == 0 ||
+                                 (squeezedIndicesShape.count == 1 &&
+                                  [squeezedIndicesShape[0] integerValue] == 1);
+            if (isScalarIndex) {
+                MPSGraphTensor* scalarIndex = squeezedIndices;
+                if (scalarIndex.shape.count == 0) {
+                    scalarIndex = [g reshapeTensor:scalarIndex withShape:@[ @1 ] name:nil];
+                }
+                MPSGraphTensor* zero =
+                    [g constantWithScalar:0 shape:@[ @1 ] dataType:MPSDataTypeInt32];
 
-        return result;
+                NSMutableArray<MPSGraphTensor*>* startParts =
+                    [NSMutableArray arrayWithCapacity:operand.shape.count];
+                for (NSUInteger d = 0; d < operand.shape.count; ++d) {
+                    if ((int64_t)d == gatherAxis) {
+                        [startParts addObject:scalarIndex];
+                    } else {
+                        [startParts addObject:zero];
+                    }
+                }
+                MPSGraphTensor* startVec = [g concatTensors:startParts dimension:0 name:nil];
+
+                NSMutableArray<MPSGraphTensor*>* sizeParts =
+                    [NSMutableArray arrayWithCapacity:sliceSizes.size()];
+                for (int64_t sz : sliceSizes) {
+                    [sizeParts addObject:[g constantWithScalar:sz
+                                                         shape:@[ @1 ]
+                                                      dataType:MPSDataTypeInt32]];
+                }
+                MPSGraphTensor* sizeVec = [g concatTensors:sizeParts dimension:0 name:nil];
+
+                NSUInteger squeezeMask = 0;
+                for (int64_t dim : collapsedSliceDims) {
+                    if (dim >= 0 && dim < 63) {
+                        squeezeMask |= (1ULL << (NSUInteger)dim);
+                    }
+                }
+
+                MPSGraphTensor* sliced = [g sliceTensor:operand
+                                            startTensor:startVec
+                                             sizeTensor:sizeVec
+                                            squeezeMask:squeezeMask
+                                                   name:nil];
+                NSArray<NSNumber*>* outputShape = GetOutputShape(op);
+                if (outputShape) {
+                    sliced =
+                        ReshapeOrBroadcastToShape(g, sliced, outputShape, "gather-scalar-dynamic-slice");
+                }
+                return sliced;
+            }
+        }
+
+        NSUInteger batchDims = 0;
+        NSArray<NSNumber*>* operandShape = operand.shape;
+        NSArray<NSNumber*>* squeezedIndicesShape = squeezedIndices.shape;
+        if (operandShape.count == squeezedIndicesShape.count && operandShape.count >= 3) {
+            // Flatten non-gather dimensions into a batch axis to avoid MPSGraph gather shape bugs
+            // on high-rank batched selectors used by take_along_axis.
+            NSMutableArray<NSNumber*>* perm = [NSMutableArray array];
+            for (NSUInteger d = 0; d < operandShape.count; ++d) {
+                if ((int64_t)d != gatherAxis)
+                    [perm addObject:@(d)];
+            }
+            [perm addObject:@(gatherAxis)];
+
+            MPSGraphTensor* transposedOperand = [g transposeTensor:operand permutation:perm name:nil];
+            MPSGraphTensor* transposedIndices =
+                [g transposeTensor:squeezedIndices permutation:perm name:nil];
+
+            NSArray<NSNumber*>* transposedIndicesShape = transposedIndices.shape;
+            int64_t axisSize = [operandShape[(NSUInteger)gatherAxis] longLongValue];
+            int64_t indexCount =
+                [transposedIndicesShape[(NSUInteger)transposedIndicesShape.count - 1] longLongValue];
+            int64_t flatBatch = 1;
+            for (NSUInteger d = 0; d + 1 < transposedIndicesShape.count; ++d) {
+                flatBatch *= [transposedIndicesShape[d] longLongValue];
+            }
+
+            MPSGraphTensor* flatOperand =
+                [g reshapeTensor:transposedOperand withShape:@[ @(flatBatch), @(axisSize) ] name:nil];
+            MPSGraphTensor* flatIndices = [g reshapeTensor:transposedIndices
+                                                 withShape:@[ @(flatBatch), @(indexCount) ]
+                                                      name:nil];
+            flatIndices = EnsureInt32(g, flatIndices);
+
+            MPSGraphTensor* flatGathered = [g gatherWithUpdatesTensor:flatOperand
+                                                         indicesTensor:flatIndices
+                                                                  axis:1
+                                                       batchDimensions:1
+                                                                  name:nil];
+            MPSGraphTensor* gathered =
+                [g reshapeTensor:flatGathered withShape:transposedIndicesShape name:nil];
+
+            NSMutableArray<NSNumber*>* invPerm = [NSMutableArray array];
+            for (NSUInteger i = 0; i < perm.count; ++i)
+                [invPerm addObject:@0];
+            for (NSUInteger i = 0; i < perm.count; ++i) {
+                NSInteger p = [perm[i] integerValue];
+                invPerm[(NSUInteger)p] = @(i);
+            }
+            gathered = [g transposeTensor:gathered permutation:invPerm name:nil];
+
+            NSArray<NSNumber*>* outputShape = GetOutputShape(op);
+            if (outputShape) {
+                gathered = [g reshapeTensor:gathered withShape:outputShape name:nil];
+            }
+            return gathered;
+        }
+
+        // Infer batch dimensions from shared leading dimensions before gatherAxis.
+        while (batchDims < (NSUInteger)gatherAxis && batchDims < operandShape.count &&
+               batchDims < squeezedIndicesShape.count &&
+               [operandShape[batchDims] integerValue] == [squeezedIndicesShape[batchDims] integerValue]) {
+            batchDims++;
+        }
+
+        return [g gatherWithUpdatesTensor:operand
+                            indicesTensor:squeezedIndices
+                                     axis:(NSUInteger)gatherAxis
+                          batchDimensions:batchDims
+                                     name:nil];
+    }
+
+    // Selector introduces a new axis:
+    // operand [B, S, V], indices [B, T, 2] (batch, vocab) -> output [B, T, S].
+    if (operand.shape.count == 3 && indicesRank == 3 && indexVectorDim == 2 &&
+        startIndexMap.size() == 2 && collapsedSliceDims.size() == 2 && offsetDims.size() == 1 &&
+        sliceSizes.size() == 3) {
+        bool collapsed0 = false, collapsed2 = false;
+        for (int64_t d : collapsedSliceDims) {
+            if (d == 0)
+                collapsed0 = true;
+            else if (d == 2)
+                collapsed2 = true;
+        }
+        int64_t compBatch = -1;
+        int64_t compVocab = -1;
+        for (size_t j = 0; j < startIndexMap.size(); ++j) {
+            if (startIndexMap[j] == 0)
+                compBatch = (int64_t)j;
+            else if (startIndexMap[j] == 2)
+                compVocab = (int64_t)j;
+        }
+        if (collapsed0 && collapsed2 && compBatch >= 0 && compVocab >= 0 && sliceSizes[0] == 1 &&
+            sliceSizes[2] == 1) {
+            MPSGraphTensor* vocab2D =
+                [g sliceTensor:startIndices dimension:2 start:compVocab length:1 name:nil];
+            MPSGraphTensor* vocabIdx =
+                [g reshapeTensor:vocab2D withShape:@[ indicesShape[0], indicesShape[1] ] name:nil];
+            vocabIdx = EnsureInt32(g, vocabIdx);
+
+            MPSGraphTensor* gathered = [g gatherWithUpdatesTensor:operand
+                                                     indicesTensor:vocabIdx
+                                                              axis:2
+                                                   batchDimensions:1
+                                                              name:nil];
+            gathered = [g transposeTensor:gathered permutation:@[ @0, @2, @1 ] name:nil];
+
+            NSArray<NSNumber*>* outputShape = GetOutputShape(op);
+            if (outputShape) {
+                gathered = [g reshapeTensor:gathered withShape:outputShape name:nil];
+            }
+            return gathered;
+        }
+    }
+
+    // Non-contiguous batched selector pattern:
+    // operand [B, X, Z, Y], indices [B, 3] (batch, x, y) -> output [B, Z].
+    if (indexVectorDim == 1 && indicesRank == 2 && operand.shape.count == 4 &&
+        startIndexMap.size() == 3 && offsetDims.size() == 1 && offsetDims[0] == 1 &&
+        collapsedSliceDims.size() == 3 && sliceSizes.size() == 4) {
+        auto findIndexComponent = [&](int64_t operandDim) -> int64_t {
+            for (size_t j = 0; j < startIndexMap.size(); ++j) {
+                if (startIndexMap[j] == operandDim)
+                    return (int64_t)j;
+            }
+            return -1;
+        };
+
+        bool collapsed0 = false, collapsed1 = false, collapsed3 = false;
+        for (int64_t d : collapsedSliceDims) {
+            if (d == 0)
+                collapsed0 = true;
+            else if (d == 1)
+                collapsed1 = true;
+            else if (d == 3)
+                collapsed3 = true;
+        }
+
+        int64_t compBatch = findIndexComponent(0);
+        int64_t compX = findIndexComponent(1);
+        int64_t compY = findIndexComponent(3);
+        if (collapsed0 && collapsed1 && collapsed3 && compBatch >= 0 && compX >= 0 && compY >= 0 &&
+            sliceSizes[0] == 1 && sliceSizes[1] == 1 && sliceSizes[3] == 1) {
+            NSArray<NSNumber*>* operandShape = operand.shape;
+            int64_t batch = [operandShape[0] longLongValue];
+            int64_t xSize = [operandShape[1] longLongValue];
+            int64_t zSize = [operandShape[2] longLongValue];
+            int64_t ySize = [operandShape[3] longLongValue];
+
+            MPSDataType idxType = startIndices.dataType;
+            MPSGraphTensor* zeroIdx = [g constantWithScalar:0 shape:@[ @1 ] dataType:idxType];
+            MPSGraphTensor* oneIdx = [g constantWithScalar:1 shape:@[ @1 ] dataType:idxType];
+            MPSGraphTensor* zSizeIdx = [g constantWithScalar:zSize shape:@[ @1 ] dataType:idxType];
+            MPSGraphTensor* sizeVec = [g concatTensors:@[ oneIdx, zSizeIdx, oneIdx ] dimension:0 name:nil];
+
+            NSMutableArray<MPSGraphTensor*>* batchRows = [NSMutableArray array];
+            for (int64_t b = 0; b < batch; ++b) {
+                MPSGraphTensor* batchSlice4 = [g sliceTensor:operand
+                                                   dimension:0
+                                                       start:b
+                                                      length:1
+                                                        name:nil];
+                MPSGraphTensor* batchSlice =
+                    [g reshapeTensor:batchSlice4 withShape:@[ @(xSize), @(zSize), @(ySize) ] name:nil];
+
+                MPSGraphTensor* row2D = [g sliceTensor:startIndices
+                                             dimension:0
+                                                 start:b
+                                                length:1
+                                                  name:nil];
+                MPSGraphTensor* x2D = [g sliceTensor:row2D dimension:1 start:compX length:1 name:nil];
+                MPSGraphTensor* y2D = [g sliceTensor:row2D dimension:1 start:compY length:1 name:nil];
+                MPSGraphTensor* x1D = EnsureInt32(g, [g reshapeTensor:x2D withShape:@[ @1 ] name:nil]);
+                MPSGraphTensor* y1D = EnsureInt32(g, [g reshapeTensor:y2D withShape:@[ @1 ] name:nil]);
+                MPSGraphTensor* startVec = [g concatTensors:@[ x1D, zeroIdx, y1D ] dimension:0 name:nil];
+
+                MPSGraphTensor* slice = [g sliceTensor:batchSlice
+                                           startTensor:startVec
+                                            sizeTensor:sizeVec
+                                           squeezeMask:0
+                                                  name:nil];
+                MPSGraphTensor* row = [g reshapeTensor:slice withShape:@[ @1, @(zSize) ] name:nil];
+                [batchRows addObject:row];
+            }
+
+            if (batchRows.count > 0) {
+                MPSGraphTensor* result = [g concatTensors:batchRows dimension:0 name:nil];
+                NSArray<NSNumber*>* outputShape = GetOutputShape(op);
+                if (outputShape) {
+                    result = [g reshapeTensor:result withShape:outputShape name:nil];
+                }
+                return result;
+            }
+        }
+    }
+
+    // General gatherND lowering for patterns where index vectors are carried in
+    // the last indices dimension, which covers common advanced-indexing forms.
+    if (indexVectorDim == (int64_t)indicesRank - 1) {
+        MPSGraphTensor* ndIndices = EnsureInt32(g, startIndices);
+        return [g gatherNDWithUpdatesTensor:operand indicesTensor:ndIndices batchDimensions:0 name:nil];
     }
 
     // For now, log unsupported patterns
@@ -517,6 +832,134 @@ static MPSGraphTensor* Handle_scatter(MPSGraph* g, mlir::Operation* op, ValueMap
 
     NSArray<NSNumber*>* indicesShape = scatterIndices.shape;
     NSUInteger indicesRank = indicesShape.count;
+    // Handle dynamic-update-slice-like 1D scatter:
+    // input: [N], indices: [1], updates: [M], update_window_dims=[0]
+    // This pattern appears in jnp.unique internals and is not representable
+    // via scatterWithDataTensor directly.
+    if (input.shape.count == 1 && updates.shape.count == 1 && indicesRank == 1 &&
+        [indicesShape[0] integerValue] == 1 && scatterDimsToOperandDims.size() == 1 &&
+        scatterDimsToOperandDims[0] == 0 && updateWindowDims.size() == 1 &&
+        updateWindowDims[0] == 0 && insertedWindowDims.empty()) {
+        int64_t inputLen = [input.shape[0] longLongValue];
+        int64_t updateLen = [updates.shape[0] longLongValue];
+
+        if (@available(macOS 15.2, *)) {
+            MPSGraphTensor* start = EnsureInt32(g, scatterIndices);
+            MPSGraphTensor* zero = [g constantWithScalar:0 shape:@[@1] dataType:start.dataType];
+            MPSGraphTensor* updateLenTensor =
+                [g constantWithScalar:updateLen shape:@[@1] dataType:start.dataType];
+            MPSGraphTensor* inputLenTensor =
+                [g constantWithScalar:inputLen shape:@[@1] dataType:start.dataType];
+
+            MPSGraphTensor* prefix =
+                [g sliceTensor:input startTensor:zero sizeTensor:start squeezeMask:0 name:nil];
+            MPSGraphTensor* suffixStart =
+                [g additionWithPrimaryTensor:start secondaryTensor:updateLenTensor name:nil];
+            MPSGraphTensor* suffixSize =
+                [g subtractionWithPrimaryTensor:inputLenTensor secondaryTensor:suffixStart name:nil];
+            MPSGraphTensor* suffix = [g sliceTensor:input
+                                        startTensor:suffixStart
+                                         sizeTensor:suffixSize
+                                        squeezeMask:0
+                                               name:nil];
+            return [g concatTensors:@[ prefix, updates, suffix ] dimension:0 name:nil];
+        } else {
+            auto maybeStart = TryGetConstScalarInt(op->getOperand(1));
+            if (maybeStart) {
+                int64_t start = *maybeStart;
+                if (start >= 0 && start <= inputLen && updateLen >= 0 && start + updateLen <= inputLen) {
+                    NSMutableArray<MPSGraphTensor*>* pieces = [NSMutableArray array];
+                    if (start > 0) {
+                        MPSGraphTensor* prefix =
+                            [g sliceTensor:input dimension:0 start:0 length:start name:nil];
+                        [pieces addObject:prefix];
+                    }
+                    [pieces addObject:updates];
+                    int64_t suffixStart = start + updateLen;
+                    int64_t suffixLen = inputLen - suffixStart;
+                    if (suffixLen > 0) {
+                        MPSGraphTensor* suffix = [g sliceTensor:input
+                                                       dimension:0
+                                                           start:suffixStart
+                                                          length:suffixLen
+                                                            name:nil];
+                        [pieces addObject:suffix];
+                    }
+                    if (pieces.count == 1) {
+                        return pieces[0];
+                    }
+                    return [g concatTensors:pieces dimension:0 name:nil];
+                }
+            }
+        }
+    }
+
+    // Pointwise scatter with explicit full-rank coordinates.
+    // Examples:
+    // - input[B,S,V], indices[B,S,3], updates[B,S]
+    // - input[B,V],   indices[B,2],   updates[B]
+    if (updateWindowDims.empty() && indexVectorDim == (int64_t)indicesRank - 1 &&
+        insertedWindowDims.size() == input.shape.count &&
+        scatterDimsToOperandDims.size() == input.shape.count &&
+        [indicesShape[indicesRank - 1] integerValue] == (NSInteger)input.shape.count &&
+        updates.shape.count + 1 == indicesRank) {
+        int64_t flatCount = 1;
+        for (NSUInteger i = 0; i + 1 < indicesRank; ++i) {
+            flatCount *= [indicesShape[i] longLongValue];
+        }
+        MPSGraphTensor* flatIndices = [g reshapeTensor:scatterIndices
+                                             withShape:@[ @(flatCount), @((NSInteger)input.shape.count) ]
+                                                  name:nil];
+        flatIndices = EnsureInt32(g, flatIndices);
+        MPSGraphTensor* flatUpdates =
+            [g reshapeTensor:updates withShape:@[ @(flatCount) ] name:nil];
+
+        MPSGraphScatterMode mode = MPSGraphScatterModeSet;
+        auto& updateRegion = scatterOp.getUpdateComputation();
+        if (!updateRegion.empty()) {
+            auto& block = updateRegion.front();
+            for (auto& innerOp : block) {
+                if (mlir::isa<mlir::stablehlo::AddOp>(innerOp)) {
+                    mode = MPSGraphScatterModeAdd;
+                    break;
+                } else if (mlir::isa<mlir::stablehlo::SubtractOp>(innerOp)) {
+                    mode = MPSGraphScatterModeSub;
+                    break;
+                } else if (mlir::isa<mlir::stablehlo::MulOp>(innerOp)) {
+                    mode = MPSGraphScatterModeMul;
+                    break;
+                } else if (mlir::isa<mlir::stablehlo::DivOp>(innerOp)) {
+                    mode = MPSGraphScatterModeDiv;
+                    break;
+                } else if (mlir::isa<mlir::stablehlo::MaxOp>(innerOp)) {
+                    mode = MPSGraphScatterModeMax;
+                    break;
+                } else if (mlir::isa<mlir::stablehlo::MinOp>(innerOp)) {
+                    mode = MPSGraphScatterModeMin;
+                    break;
+                }
+            }
+        }
+
+        MPSGraphTensor* scatterInput = input;
+        MPSGraphTensor* scatterUpdates = flatUpdates;
+        bool castBackToBool = (input.dataType == MPSDataTypeBool);
+        if (castBackToBool) {
+            scatterInput = [g castTensor:input toType:MPSDataTypeInt32 name:nil];
+            scatterUpdates = [g castTensor:flatUpdates toType:MPSDataTypeInt32 name:nil];
+        }
+
+        MPSGraphTensor* scattered = [g scatterNDWithDataTensor:scatterInput
+                                                  updatesTensor:scatterUpdates
+                                                  indicesTensor:flatIndices
+                                               batchDimensions:0
+                                                           mode:mode
+                                                           name:nil];
+        if (castBackToBool) {
+            scattered = [g castTensor:scattered toType:MPSDataTypeBool name:nil];
+        }
+        return scattered;
+    }
 
     // Handle common embedding gradient pattern (reverse of gather):
     // input: [num_embeddings, embedding_dim] - zeros initially
@@ -530,7 +973,8 @@ static MPSGraphTensor* Handle_scatter(MPSGraph* g, mlir::Operation* op, ValueMap
     // - we're scattering along a single dimension
     if (indexVectorDim == (int64_t)indicesRank - 1 &&
         [indicesShape[indicesRank - 1] integerValue] == 1 && scatterDimsToOperandDims.size() == 1 &&
-        insertedWindowDims.size() == 1 && insertedWindowDims[0] == scatterDimsToOperandDims[0]) {
+        (insertedWindowDims.empty() ||
+         (insertedWindowDims.size() == 1 && insertedWindowDims[0] == scatterDimsToOperandDims[0]))) {
         int64_t scatterAxis = scatterDimsToOperandDims[0];
 
         // Squeeze the index vector dimension from indices
@@ -580,17 +1024,90 @@ static MPSGraphTensor* Handle_scatter(MPSGraph* g, mlir::Operation* op, ValueMap
             }
         }
 
+        // Batched single-axis updates into a rank-2 tensor (e.g. vmapped dynamic_update_slice)
+        // are not representable via scatterWithDataTensor directly because each batch element has
+        // a different index along the scatter axis. Lower these as scatterND with explicit
+        // [batch, index] coordinates.
+        bool batchedScalarUpdate =
+            (updates.shape.count == 1 && [updates.shape[0] integerValue] == [indicesShape[0] integerValue]) ||
+            (updates.shape.count == 2 && [updates.shape[0] integerValue] == [indicesShape[0] integerValue] &&
+             [updates.shape[1] integerValue] == 1);
+
+        if (insertedWindowDims.empty() && input.shape.count == 2 && indicesRank == 2 &&
+            [indicesShape[indicesRank - 1] integerValue] == 1 && batchedScalarUpdate) {
+            NSNumber* batch = indicesShape[0];
+            NSArray<NSNumber*>* prefixShape = @[ batch ];
+
+            MPSGraphTensor* squeezedIndices =
+                [g reshapeTensor:scatterIndices withShape:prefixShape name:nil];
+            squeezedIndices = EnsureInt32(g, squeezedIndices);
+
+            MPSGraphTensor* scalarUpdates = updates;
+            if (updates.shape.count == 2 && [updates.shape[1] integerValue] == 1) {
+                scalarUpdates = [g reshapeTensor:updates withShape:prefixShape name:nil];
+            }
+
+            MPSGraphTensor* batchCoords =
+                [g coordinateAlongAxis:0 withShape:prefixShape name:nil];
+            batchCoords = EnsureInt32(g, batchCoords);
+
+            NSMutableArray<MPSGraphTensor*>* coordTensors = [NSMutableArray arrayWithCapacity:2];
+            if (scatterAxis == 0) {
+                [coordTensors addObject:squeezedIndices];
+                [coordTensors addObject:batchCoords];
+            } else if (scatterAxis == 1) {
+                [coordTensors addObject:batchCoords];
+                [coordTensors addObject:squeezedIndices];
+            } else {
+                MPS_LOG_ERROR("Unsupported scatter axis for rank-2 batched scatter: %lld\n",
+                              scatterAxis);
+                return nullptr;
+            }
+
+            MPSGraphTensor* ndIndices = [g stackTensors:coordTensors axis:1 name:nil];
+            MPSGraphTensor* scatterInput = input;
+            MPSGraphTensor* scatterUpdates = scalarUpdates;
+            bool castBackToBool = (input.dataType == MPSDataTypeBool);
+            if (castBackToBool) {
+                scatterInput = [g castTensor:input toType:MPSDataTypeInt32 name:nil];
+                scatterUpdates = [g castTensor:scalarUpdates toType:MPSDataTypeInt32 name:nil];
+            }
+
+            MPSGraphTensor* scattered = [g scatterNDWithDataTensor:scatterInput
+                                                      updatesTensor:scatterUpdates
+                                                      indicesTensor:ndIndices
+                                                   batchDimensions:0
+                                                               mode:mode
+                                                               name:nil];
+            if (castBackToBool) {
+                scattered = [g castTensor:scattered toType:MPSDataTypeBool name:nil];
+            }
+            return scattered;
+        }
+
         // Ensure updates is at least rank 1 (MPS doesn't support scalar updates)
         if (updates.shape.count == 0)
             updates = [g reshapeTensor:updates withShape:@[@1] name:nil];
 
         // Use scatterWithDataTensor to scatter updates into input
-        return [g scatterWithDataTensor:input
-                          updatesTensor:updates
-                          indicesTensor:squeezedIndices
-                                   axis:(NSUInteger)scatterAxis
-                                   mode:mode
-                                   name:nil];
+        MPSGraphTensor* scatterInput = input;
+        MPSGraphTensor* scatterUpdates = updates;
+        bool castBackToBool = (input.dataType == MPSDataTypeBool);
+        if (castBackToBool) {
+            scatterInput = [g castTensor:input toType:MPSDataTypeInt32 name:nil];
+            scatterUpdates = [g castTensor:updates toType:MPSDataTypeInt32 name:nil];
+        }
+
+        MPSGraphTensor* scattered = [g scatterWithDataTensor:scatterInput
+                                               updatesTensor:scatterUpdates
+                                               indicesTensor:squeezedIndices
+                                                        axis:(NSUInteger)scatterAxis
+                                                        mode:mode
+                                                        name:nil];
+        if (castBackToBool) {
+            scattered = [g castTensor:scattered toType:MPSDataTypeBool name:nil];
+        }
+        return scattered;
     }
 
     MPS_LOG_ERROR("Unsupported scatter pattern - update_window_dims size: %lu, "
