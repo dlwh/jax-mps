@@ -119,7 +119,7 @@ static std::string ConstantCseKey(mlir::Operation* op) {
            AttrToString(value_attr);
 }
 
-static std::string BroadcastInDimCseKey(mlir::Operation* op) {
+static std::string BroadcastInDimCseKey(mlir::Operation* op, const ValueMap& values) {
     if (op->getNumResults() != 1 || op->getNumOperands() != 1) {
         return "";
     }
@@ -127,8 +127,12 @@ static std::string BroadcastInDimCseKey(mlir::Operation* op) {
     if (!dims_attr) {
         return "";
     }
+    auto it = values.find(op->getOperand(0).getAsOpaquePointer());
+    if (it == values.end() || !it->second) {
+        return "";
+    }
     return std::string("broadcast_in_dim|") +
-           std::to_string(reinterpret_cast<uintptr_t>(op->getOperand(0).getAsOpaquePointer())) +
+           std::to_string(reinterpret_cast<uintptr_t>(it->second)) +
            "|" + TypeToString(op->getResult(0).getType()) + "|" + AttrToString(dims_attr);
 }
 
@@ -338,7 +342,7 @@ static ProcessResult processOperations(MPSGraph* graph, mlir::Block& block, Valu
             }
         }
         if (op_name == "stablehlo.broadcast_in_dim" && op->getNumResults() == 1) {
-            std::string key = BroadcastInDimCseKey(op);
+            std::string key = BroadcastInDimCseKey(op, values);
             if (!key.empty()) {
                 auto it = context.broadcast_in_dim_cache.find(key);
                 if (it != context.broadcast_in_dim_cache.end()) {
@@ -379,7 +383,7 @@ static ProcessResult processOperations(MPSGraph* graph, mlir::Block& block, Valu
                     context.constant_cache[key] = out;
                 }
             } else if (op_name == "stablehlo.broadcast_in_dim") {
-                std::string key = BroadcastInDimCseKey(op);
+                std::string key = BroadcastInDimCseKey(op, values);
                 if (!key.empty()) {
                     context.broadcast_in_dim_cache[key] = out;
                 }
