@@ -1,5 +1,8 @@
 // Tensor creation operations: constant, iota
 
+#include <cstring>
+#include <vector>
+
 #import "pjrt_plugin/ops/registry.h"
 
 namespace jax_mps {
@@ -43,7 +46,6 @@ static ProcessResult HandleConstant(MPSGraph* g, mlir::Operation* op, ValueMap& 
         // Check if it's a splat (single value broadcast to all elements)
         if (denseAttr.isSplat()) {
             auto elemType = denseAttr.getElementType();
-            double scalarValue = 0.0;
 
             // Complex splat: extract real and imaginary parts separately.
             if (auto complexType = mlir::dyn_cast<mlir::ComplexType>(elemType)) {
@@ -63,32 +65,30 @@ static ProcessResult HandleConstant(MPSGraph* g, mlir::Operation* op, ValueMap& 
                 return Result(values, op, result, "constant");
             }
 
-            if (elemType.isF32()) {
-                scalarValue = denseAttr.getSplatValue<float>();
-            } else if (elemType.isF64()) {
-                scalarValue = denseAttr.getSplatValue<double>();
-            } else if (elemType.isF16()) {
-                auto apVal = denseAttr.getSplatValue<llvm::APFloat>();
-                scalarValue = apVal.convertToFloat();
-            } else if (auto intType = mlir::dyn_cast<mlir::IntegerType>(elemType)) {
-                auto apInt = denseAttr.getSplatValue<llvm::APInt>();
-                // For signless integers (the default in MLIR/StableHLO), use sign-extend
-                // to preserve the two's complement representation.
-                // Only use zero-extend for explicitly unsigned types.
-                if (intType.isUnsigned()) {
-                    scalarValue = static_cast<double>(apInt.getZExtValue());
-                } else {
-                    // Signless or signed - use sign-extend
-                    scalarValue = static_cast<double>(apInt.getSExtValue());
-                }
+            // Use raw-element replication for splats instead of constantWithScalar.
+            // This preserves exact bit patterns for BF16 and avoids scalar conversion pitfalls.
+            auto rawData = denseAttr.getRawData();
+            size_t elemSize = rawData.size();
+            if (elemSize == 0) {
+                return ProcessResult::Error("constant: invalid splat element size");
             }
 
-            if (shape.count == 0) {
-                // True scalar
-                result = [g constantWithScalar:scalarValue dataType:dtype];
-            } else {
-                // Splat to shape
-                result = [g constantWithScalar:scalarValue shape:shape dataType:dtype];
+            bool isScalarShape = (shape.count == 0);
+            NSArray<NSNumber*>* storageShape = isScalarShape ? @[@1] : shape;
+
+            size_t numel = 1;
+            for (NSNumber* dim in storageShape) {
+                numel *= (size_t)[dim unsignedLongLongValue];
+            }
+
+            std::vector<uint8_t> expanded(elemSize * numel);
+            for (size_t i = 0; i < numel; ++i) {
+                memcpy(expanded.data() + i * elemSize, rawData.data(), elemSize);
+            }
+            NSData* data = [NSData dataWithBytes:expanded.data() length:expanded.size()];
+            result = [g constantWithData:data shape:storageShape dataType:dtype];
+            if (isScalarShape) {
+                result = [g reshapeTensor:result withShape:@[] name:nil];
             }
         } else {
             // Non-splat dense constant - use raw data
