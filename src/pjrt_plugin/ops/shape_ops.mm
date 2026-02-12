@@ -583,9 +583,51 @@ static ProcessResult HandleScatter(MPSGraph* g, mlir::Operation* op, ValueMap& v
 
         MPSGraphScatterMode mode = GetScatterMode(scatterOp);
 
-        // Ensure updates is at least rank 1 (MPS doesn't support scalar updates)
-        if (updates.shape.count == 0)
+        // Ensure updates has a valid scatter-axis dimension for MPS.
+        // StableHLO often represents this as an inserted window dim, so updates can be rank-1
+        // relative to the input. MPS expects that axis to be explicit with length matching indices.
+        if (updates.shape.count == 0) {
             updates = [g reshapeTensor:updates withShape:@[@1] name:nil];
+        }
+
+        if (updates.shape.count + 1 == input.shape.count) {
+            NSInteger idxLen = 1;
+            if (squeezedIndices.shape.count > 0) {
+                idxLen = [[squeezedIndices.shape lastObject] integerValue];
+            }
+
+            NSMutableArray<NSNumber*>* expandedUpdatesShape =
+                [NSMutableArray arrayWithCapacity:input.shape.count];
+            NSUInteger srcDim = 0;
+            for (NSUInteger dstDim = 0; dstDim < input.shape.count; ++dstDim) {
+                if ((int64_t)dstDim == scatterAxis) {
+                    [expandedUpdatesShape addObject:@(idxLen)];
+                } else {
+                    [expandedUpdatesShape addObject:updates.shape[srcDim]];
+                    srcDim++;
+                }
+            }
+            updates = [g reshapeTensor:updates withShape:expandedUpdatesShape name:nil];
+        }
+
+        // Embedding-gradient style scatter_add:
+        // input: [V, H], indices: [B, T], updates: [B, T, H]
+        // MPS axis scatter expects updates rank == input rank, so flatten [B, T] -> [B*T].
+        if (input.shape.count == 2 && (int64_t)scatterAxis == 0 &&
+            updates.shape.count > input.shape.count && squeezedIndices.shape.count > 1) {
+            NSInteger flatLen = 1;
+            for (NSNumber* dim in squeezedIndices.shape) {
+                flatLen *= [dim integerValue];
+            }
+
+            squeezedIndices = [g reshapeTensor:squeezedIndices withShape:@[@(flatLen)] name:nil];
+            updates = [g reshapeTensor:updates
+                             withShape:@[
+                                 @(flatLen),
+                                 input.shape[1],
+                             ]
+                                  name:nil];
+        }
 
         // Use scatterWithDataTensor to scatter updates into input
         MPSGraphTensor* result = [g scatterWithDataTensor:input

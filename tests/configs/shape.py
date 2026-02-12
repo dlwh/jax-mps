@@ -1,3 +1,4 @@
+import numpy
 from jax import numpy as jnp
 
 from .util import OperationTestConfig, complex_standard_normal
@@ -60,5 +61,21 @@ def make_shape_op_configs():
                 lambda rng: rng.normal(size=(3, 3)),
                 # Grad crashes with fatal Metal abort (sliceUpdateDataTensor shape mismatch).
                 differentiable_argnums=(),
+            ),
+            OperationTestConfig(
+                lambda table, indices: jnp.sum(jnp.take(table, indices, axis=0)),
+                lambda rng: jnp.asarray(
+                    rng.standard_normal((3, 12, 256, 64)), dtype=jnp.bfloat16
+                ),
+                lambda rng: rng.integers(0, 3, size=(1,), dtype=numpy.int32),
+                differentiable_argnums=(0,),
+                name="gather-grad-axis0-bf16",
+            ),
+            OperationTestConfig(
+                lambda table, indices: jnp.sum(jnp.take(table, indices, axis=0)),
+                lambda rng: jnp.asarray(rng.standard_normal((5, 7)), dtype=jnp.float32),
+                lambda rng: rng.integers(0, 5, size=(2, 3), dtype=numpy.int32),
+                differentiable_argnums=(0,),
+                name="gather-grad-axis0-f32-batched-indices",
             ),
         ]

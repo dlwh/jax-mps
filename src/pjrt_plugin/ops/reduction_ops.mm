@@ -1,5 +1,7 @@
 // Reduction operations: reduce (sum, product, max, min, and, or, argmax, argmin)
 
+#include <algorithm>
+
 #import "pjrt_plugin/ops/registry.h"
 #include "stablehlo/dialect/StablehloOps.h"
 
@@ -98,29 +100,72 @@ static ProcessResult HandleSingleResultReduce(MPSGraph* g, mlir::Operation* op, 
         return ProcessResult::Error("reduce: input tensor not found");
     }
 
-    // Get reduction dimensions
+    // Canonicalize to a 2D reduction so MPS reduction kernels always see minor axes.
     auto dimensions = reduceOp.getDimensions();
-    NSMutableArray<NSNumber*>* axes = [NSMutableArray array];
-    for (int64_t dim : dimensions) {
-        [axes addObject:@(dim)];
+    const NSInteger rank = (NSInteger)input.shape.count;
+    std::vector<int64_t> reducedDims(dimensions.begin(), dimensions.end());
+    std::vector<int64_t> nonReducedDims;
+    nonReducedDims.reserve((size_t)rank);
+    for (NSInteger i = 0; i < rank; ++i) {
+        if (std::find(reducedDims.begin(), reducedDims.end(), (int64_t)i) == reducedDims.end()) {
+            nonReducedDims.push_back((int64_t)i);
+        }
     }
+
+    std::vector<int64_t> permutation;
+    permutation.reserve((size_t)rank);
+    permutation.insert(permutation.end(), nonReducedDims.begin(), nonReducedDims.end());
+    permutation.insert(permutation.end(), reducedDims.begin(), reducedDims.end());
+
+    auto isIdentityPermutation = [](const std::vector<int64_t>& perm) {
+        for (size_t i = 0; i < perm.size(); ++i) {
+            if ((int64_t)i != perm[i]) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto productOfDims = [](NSArray<NSNumber*>* shape,
+                            const std::vector<int64_t>& dims) -> int64_t {
+        int64_t prod = 1;
+        for (int64_t d : dims) {
+            prod *= [shape[(NSUInteger)d] longLongValue];
+        }
+        return prod;
+    };
+
+    MPSGraphTensor* canonicalInput = input;
+    if (!isIdentityPermutation(permutation)) {
+        NSMutableArray<NSNumber*>* perm = [NSMutableArray arrayWithCapacity:permutation.size()];
+        for (int64_t d : permutation) {
+            [perm addObject:@(d)];
+        }
+        canonicalInput = [g transposeTensor:canonicalInput permutation:perm name:nil];
+    }
+
+    int64_t nonReducedSize = productOfDims(input.shape, nonReducedDims);
+    int64_t reducedSize = productOfDims(input.shape, reducedDims);
+    canonicalInput = [g reshapeTensor:canonicalInput
+                            withShape:@[@(nonReducedSize), @(reducedSize)]
+                                 name:nil];
 
     // Identify the reduction operation from the body
     std::string reductionType = GetReductionOpType(reduceOp.getBody());
 
     MPSGraphTensor* result = nullptr;
     if (reductionType == "stablehlo.add") {
-        result = [g reductionSumWithTensor:input axes:axes name:nil];
+        result = [g reductionSumWithTensor:canonicalInput axis:1 name:nil];
     } else if (reductionType == "stablehlo.multiply") {
-        result = [g reductionProductWithTensor:input axes:axes name:nil];
+        result = [g reductionProductWithTensor:canonicalInput axis:1 name:nil];
     } else if (reductionType == "stablehlo.maximum") {
-        result = [g reductionMaximumWithTensor:input axes:axes name:nil];
+        result = [g reductionMaximumWithTensor:canonicalInput axis:1 name:nil];
     } else if (reductionType == "stablehlo.minimum") {
-        result = [g reductionMinimumWithTensor:input axes:axes name:nil];
+        result = [g reductionMinimumWithTensor:canonicalInput axis:1 name:nil];
     } else if (reductionType == "stablehlo.and") {
-        result = [g reductionAndWithTensor:input axes:axes name:nil];
+        result = [g reductionAndWithTensor:canonicalInput axis:1 name:nil];
     } else if (reductionType == "stablehlo.or") {
-        result = [g reductionOrWithTensor:input axes:axes name:nil];
+        result = [g reductionOrWithTensor:canonicalInput axis:1 name:nil];
     } else {
         return ProcessResult::Error("reduce: unsupported reduction type: " + reductionType);
     }
@@ -161,14 +206,58 @@ static ProcessResult HandleMultiResultReduce(MPSGraph* g, mlir::Operation* op, V
         return ProcessResult::Error("reduce: unsupported multi-result reduce body");
     }
 
+    const NSInteger rank = (NSInteger)valueInput.shape.count;
+    std::vector<int64_t> nonReducedDims;
+    nonReducedDims.reserve((size_t)rank);
+    for (NSInteger i = 0; i < rank; ++i) {
+        if (i != axis) {
+            nonReducedDims.push_back((int64_t)i);
+        }
+    }
+
+    std::vector<int64_t> permutation = nonReducedDims;
+    permutation.push_back((int64_t)axis);
+
+    auto isIdentityPermutation = [](const std::vector<int64_t>& perm) {
+        for (size_t i = 0; i < perm.size(); ++i) {
+            if ((int64_t)i != perm[i]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    auto productOfDims = [](NSArray<NSNumber*>* shape,
+                            const std::vector<int64_t>& dims) -> int64_t {
+        int64_t prod = 1;
+        for (int64_t d : dims) {
+            prod *= [shape[(NSUInteger)d] longLongValue];
+        }
+        return prod;
+    };
+
+    MPSGraphTensor* canonicalInput = valueInput;
+    if (!isIdentityPermutation(permutation)) {
+        NSMutableArray<NSNumber*>* perm = [NSMutableArray arrayWithCapacity:permutation.size()];
+        for (int64_t d : permutation) {
+            [perm addObject:@(d)];
+        }
+        canonicalInput = [g transposeTensor:canonicalInput permutation:perm name:nil];
+    }
+
+    int64_t nonReducedSize = productOfDims(valueInput.shape, nonReducedDims);
+    int64_t reducedSize = [valueInput.shape[(NSUInteger)axis] longLongValue];
+    canonicalInput = [g reshapeTensor:canonicalInput
+                            withShape:@[@(nonReducedSize), @(reducedSize)]
+                                 name:nil];
+
     MPSGraphTensor* valueOut = nullptr;
     MPSGraphTensor* indexOut = nullptr;
     if (kind == ArgReduceKind::kMax) {
-        valueOut = [g reductionMaximumWithTensor:valueInput axis:axis name:nil];
-        indexOut = [g reductionArgMaximumWithTensor:valueInput axis:axis name:nil];
+        valueOut = [g reductionMaximumWithTensor:canonicalInput axis:1 name:nil];
+        indexOut = [g reductionArgMaximumWithTensor:canonicalInput axis:1 name:nil];
     } else {
-        valueOut = [g reductionMinimumWithTensor:valueInput axis:axis name:nil];
-        indexOut = [g reductionArgMinimumWithTensor:valueInput axis:axis name:nil];
+        valueOut = [g reductionMinimumWithTensor:canonicalInput axis:1 name:nil];
+        indexOut = [g reductionArgMinimumWithTensor:canonicalInput axis:1 name:nil];
     }
     if (!valueOut || !indexOut) {
         return ProcessResult::Error("reduce: failed to lower multi-result reduce");
