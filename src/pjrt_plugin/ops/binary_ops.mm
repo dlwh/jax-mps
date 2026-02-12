@@ -1,6 +1,8 @@
 // Binary operations: add, subtract, multiply, divide, maximum, minimum,
 // compare, select, clamp, next_after, dot, dot_general
 
+#include <algorithm>
+
 #import "pjrt_plugin/ops/registry.h"
 
 namespace jax_mps {
@@ -49,51 +51,116 @@ static ProcessResult HandleDotGeneral(MPSGraph* g, mlir::Operation* op, ValueMap
 
     NSArray<NSNumber*>* lhsShape = lhs.shape;
     NSArray<NSNumber*>* rhsShape = rhs.shape;
-    NSUInteger lhsRank = lhsShape.count;
-    NSUInteger rhsRank = rhsShape.count;
+    if (!lhsShape || !rhsShape) {
+        return ProcessResult::Error("dot_general: missing input shapes");
+    }
 
-    MPSGraphTensor* result = nil;
+    auto containsDim = [](const auto& dims, int64_t dim) {
+        return std::find(dims.begin(), dims.end(), dim) != dims.end();
+    };
+    auto isIdentityPermutation = [](const std::vector<int64_t>& perm) {
+        for (size_t i = 0; i < perm.size(); ++i) {
+            if ((int64_t)i != perm[i]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    auto productOfDims = [](NSArray<NSNumber*>* shape,
+                            const std::vector<int64_t>& dims) -> int64_t {
+        int64_t prod = 1;
+        for (int64_t d : dims) {
+            prod *= [shape[(NSUInteger)d] longLongValue];
+        }
+        return prod;
+    };
 
-    // Simple case: standard 2D matmul with contraction on last/first dims
-    // LHS: (M, K), RHS: (K, N) -> (M, N)
-    if (lhsBatchDims.empty() && rhsBatchDims.empty() && lhsRank == 2 && rhsRank == 2 &&
-        lhsContractingDims.size() == 1 && rhsContractingDims.size() == 1) {
-        int64_t lhsContractDim = lhsContractingDims[0];
-        int64_t rhsContractDim = rhsContractingDims[0];
-
-        // Standard matmul: LHS contracts on dim 1, RHS contracts on dim 0
-        if (lhsContractDim == 1 && rhsContractDim == 0) {
-            result = [g matrixMultiplicationWithPrimaryTensor:lhs secondaryTensor:rhs name:nil];
-        }
-        // LHS contracts on dim 0: need to transpose LHS
-        else if (lhsContractDim == 0 && rhsContractDim == 0) {
-            MPSGraphTensor* lhsT = [g transposeTensor:lhs permutation:@[@1, @0] name:nil];
-            result = [g matrixMultiplicationWithPrimaryTensor:lhsT secondaryTensor:rhs name:nil];
-        }
-        // LHS contracts on dim 1, RHS contracts on dim 1: need to transpose RHS
-        else if (lhsContractDim == 1 && rhsContractDim == 1) {
-            MPSGraphTensor* rhsT = [g transposeTensor:rhs permutation:@[@1, @0] name:nil];
-            result = [g matrixMultiplicationWithPrimaryTensor:lhs secondaryTensor:rhsT name:nil];
-        }
-        // LHS contracts on dim 0, RHS contracts on dim 1: transpose both
-        else if (lhsContractDim == 0 && rhsContractDim == 1) {
-            MPSGraphTensor* lhsT = [g transposeTensor:lhs permutation:@[@1, @0] name:nil];
-            MPSGraphTensor* rhsT = [g transposeTensor:rhs permutation:@[@1, @0] name:nil];
-            result = [g matrixMultiplicationWithPrimaryTensor:lhsT secondaryTensor:rhsT name:nil];
+    std::vector<int64_t> lhsFreeDims;
+    lhsFreeDims.reserve(lhsShape.count);
+    for (int64_t i = 0; i < (int64_t)lhsShape.count; ++i) {
+        if (!containsDim(lhsBatchDims, i) && !containsDim(lhsContractingDims, i)) {
+            lhsFreeDims.push_back(i);
         }
     }
 
-    // Fall back to simple matmul for unhandled cases
-    if (!result) {
-        MPS_LOG_WARN(
-            "dot_general with complex contracting/batch dims, falling back to simple matmul. "
-            "LHS contracting: %lld, RHS contracting: %lld\n",
-            lhsContractingDims.empty() ? -1 : lhsContractingDims[0],
-            rhsContractingDims.empty() ? -1 : rhsContractingDims[0]);
-        result = [g matrixMultiplicationWithPrimaryTensor:lhs secondaryTensor:rhs name:nil];
+    std::vector<int64_t> rhsFreeDims;
+    rhsFreeDims.reserve(rhsShape.count);
+    for (int64_t i = 0; i < (int64_t)rhsShape.count; ++i) {
+        if (!containsDim(rhsBatchDims, i) && !containsDim(rhsContractingDims, i)) {
+            rhsFreeDims.push_back(i);
+        }
     }
 
-    return Result(values, op, result, "dot_general");
+    std::vector<int64_t> lhsPerm;
+    lhsPerm.reserve(lhsShape.count);
+    lhsPerm.insert(lhsPerm.end(), lhsBatchDims.begin(), lhsBatchDims.end());
+    lhsPerm.insert(lhsPerm.end(), lhsFreeDims.begin(), lhsFreeDims.end());
+    lhsPerm.insert(lhsPerm.end(), lhsContractingDims.begin(), lhsContractingDims.end());
+
+    std::vector<int64_t> rhsPerm;
+    rhsPerm.reserve(rhsShape.count);
+    rhsPerm.insert(rhsPerm.end(), rhsBatchDims.begin(), rhsBatchDims.end());
+    rhsPerm.insert(rhsPerm.end(), rhsContractingDims.begin(), rhsContractingDims.end());
+    rhsPerm.insert(rhsPerm.end(), rhsFreeDims.begin(), rhsFreeDims.end());
+
+    if (lhsPerm.size() != lhsShape.count || rhsPerm.size() != rhsShape.count) {
+        return ProcessResult::Error("dot_general: invalid permutation dimensions");
+    }
+
+    MPSGraphTensor* lhsPermuted = lhs;
+    if (!isIdentityPermutation(lhsPerm)) {
+        NSMutableArray<NSNumber*>* perm = [NSMutableArray arrayWithCapacity:lhsPerm.size()];
+        for (int64_t d : lhsPerm) {
+            [perm addObject:@(d)];
+        }
+        lhsPermuted = [g transposeTensor:lhs permutation:perm name:nil];
+    }
+
+    MPSGraphTensor* rhsPermuted = rhs;
+    if (!isIdentityPermutation(rhsPerm)) {
+        NSMutableArray<NSNumber*>* perm = [NSMutableArray arrayWithCapacity:rhsPerm.size()];
+        for (int64_t d : rhsPerm) {
+            [perm addObject:@(d)];
+        }
+        rhsPermuted = [g transposeTensor:rhs permutation:perm name:nil];
+    }
+
+    int64_t lhsM = productOfDims(lhsShape, lhsFreeDims);
+    int64_t rhsN = productOfDims(rhsShape, rhsFreeDims);
+    int64_t lhsK = productOfDims(lhsShape, lhsContractingDims);
+    int64_t rhsK = productOfDims(rhsShape, rhsContractingDims);
+    if (lhsK != rhsK) {
+        return ProcessResult::Error("dot_general: contracting dimensions mismatch");
+    }
+
+    NSMutableArray<NSNumber*>* batchShape = [NSMutableArray arrayWithCapacity:lhsBatchDims.size()];
+    for (int64_t d : lhsBatchDims) {
+        [batchShape addObject:lhsShape[(NSUInteger)d]];
+    }
+
+    NSMutableArray<NSNumber*>* lhsMatmulShape = [NSMutableArray arrayWithArray:batchShape];
+    [lhsMatmulShape addObject:@(lhsM)];
+    [lhsMatmulShape addObject:@(lhsK)];
+
+    NSMutableArray<NSNumber*>* rhsMatmulShape = [NSMutableArray arrayWithArray:batchShape];
+    [rhsMatmulShape addObject:@(rhsK)];
+    [rhsMatmulShape addObject:@(rhsN)];
+
+    MPSGraphTensor* lhsForMatmul = [g reshapeTensor:lhsPermuted withShape:lhsMatmulShape name:nil];
+    MPSGraphTensor* rhsForMatmul = [g reshapeTensor:rhsPermuted withShape:rhsMatmulShape name:nil];
+    MPSGraphTensor* matmul = [g matrixMultiplicationWithPrimaryTensor:lhsForMatmul
+                                                      secondaryTensor:rhsForMatmul
+                                                                 name:nil];
+    if (!matmul) {
+        return ProcessResult::Error("dot_general: matrix multiplication lowering failed");
+    }
+
+    NSArray<NSNumber*>* outputShape = GetOutputShape(op);
+    if (outputShape) {
+        matmul = [g reshapeTensor:matmul withShape:outputShape name:nil];
+    }
+
+    return Result(values, op, matmul, "dot_general");
 }
 REGISTER_MPS_OP("stablehlo.dot_general", HandleDotGeneral);
 

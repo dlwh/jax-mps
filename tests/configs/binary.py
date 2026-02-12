@@ -188,6 +188,61 @@ def make_binary_op_configs():
                 lambda rng: rng.standard_normal((3, 4)),
             ),
             OperationTestConfig(
+                lambda lhs, rhs: lax.dot_general(
+                    lhs,
+                    rhs,
+                    dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                ),
+                lambda rng: rng.standard_normal((2, 3, 4)).astype(numpy.float32),
+                lambda rng: rng.standard_normal((2, 4, 5)).astype(numpy.float32),
+                name="dot_general.batched_contract_last",
+            ),
+            OperationTestConfig(
+                lambda lhs, rhs: lax.dot_general(
+                    lhs,
+                    rhs,
+                    dimension_numbers=(((2, 3), (2, 1)), ((0,), (0,))),
+                ),
+                lambda rng: rng.standard_normal((2, 3, 4, 5)).astype(numpy.float32),
+                lambda rng: rng.standard_normal((2, 5, 4, 6)).astype(numpy.float32),
+                name="dot_general.multi_contract",
+            ),
+            OperationTestConfig(
+                lambda lhs, rhs: lax.dot_general(
+                    lhs,
+                    rhs,
+                    dimension_numbers=(((1, 2), (0, 2)), ((), ())),
+                ),
+                lambda rng: rng.standard_normal((3, 4, 5)).astype(numpy.float32),
+                lambda rng: rng.standard_normal((4, 6, 5)).astype(numpy.float32),
+                name="dot_general.no_batch_multi_contract",
+            ),
+            OperationTestConfig(
+                lambda lhs, rhs: lax.dot_general(
+                    lhs,
+                    rhs,
+                    dimension_numbers=(((3,), (3,)), ((0, 2), (0, 1))),
+                ),
+                lambda rng: rng.standard_normal((2, 5, 3, 4)).astype(numpy.float32),
+                lambda rng: rng.standard_normal((2, 3, 7, 4)).astype(numpy.float32),
+                name="dot_general.two_batch_dims",
+            ),
+            OperationTestConfig(
+                lambda lhs, rhs: lax.dot_general(
+                    lhs,
+                    rhs,
+                    dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                ),
+                lambda rng: jnp.asarray(
+                    rng.standard_normal((2, 3, 4)), dtype=jnp.bfloat16
+                ),
+                lambda rng: jnp.asarray(
+                    rng.standard_normal((2, 4, 5)), dtype=jnp.bfloat16
+                ),
+                differentiable_argnums=(),
+                name="dot_general.batched_contract_last_bf16",
+            ),
+            OperationTestConfig(
                 jnp.bitwise_and,
                 numpy.array([0, 1, 3, 7, 15], dtype=numpy.int32),
                 numpy.array([1, 3, 7, 15, 31], dtype=numpy.int32),
