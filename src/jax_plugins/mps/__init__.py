@@ -2,6 +2,7 @@
 
 import os
 import sys
+import sysconfig
 import warnings
 from pathlib import Path
 
@@ -21,10 +22,30 @@ def _get_search_paths():
     """Return list of (path, description) tuples for library search."""
     pkg_dir = Path(__file__).parent
     project_root = pkg_dir.parent.parent.parent
+    site_paths: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
+
+    for key in ("platlib", "purelib"):
+        base = sysconfig.get_path(key)
+        if not base:
+            continue
+        cand = Path(base) / "jax_plugins" / "mps" / "lib" / _LIB_NAME
+        if cand not in seen:
+            seen.add(cand)
+            site_paths.append((cand, f"{key} jax_plugins/mps/lib"))
+
+    for entry in sys.path:
+        if "site-packages" not in entry and "dist-packages" not in entry:
+            continue
+        cand = Path(entry) / "jax_plugins" / "mps" / "lib" / _LIB_NAME
+        if cand not in seen:
+            seen.add(cand)
+            site_paths.append((cand, "sys.path jax_plugins/mps/lib"))
 
     return [
         (pkg_dir / _LIB_NAME, "package directory (editable install)"),
         (pkg_dir / "lib" / _LIB_NAME, "package lib/ (wheel install)"),
+        *site_paths,
         (
             project_root / "build" / "*" / "lib" / _LIB_NAME,
             "build/*/lib/ (cmake build)",

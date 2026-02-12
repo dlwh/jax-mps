@@ -14,6 +14,29 @@ def make_misc_op_configs():
                 lambda rng: rng.standard_normal((4, 5, 6, 8)).transpose((2, 0, 1, 3)),
             ),
             OperationTestConfig(
+                lambda: jnp.array(1e-5, dtype=jnp.bfloat16),
+                differentiable_argnums=(),
+                name="constant-bf16-scalar",
+            ),
+            OperationTestConfig(
+                lambda: jnp.full((8,), 1e-5, dtype=jnp.bfloat16),
+                differentiable_argnums=(),
+                name="constant-bf16-full",
+            ),
+            OperationTestConfig(
+                lambda: jnp.ones((8,), dtype=jnp.bfloat16),
+                differentiable_argnums=(),
+                name="constant-bf16-ones",
+            ),
+            OperationTestConfig(
+                lambda x: x + jnp.array(1.0, dtype=jnp.bfloat16),
+                lambda rng: jnp.asarray(
+                    rng.standard_normal((8, 8)), dtype=jnp.bfloat16
+                ),
+                differentiable_argnums=(),
+                name="constant-bf16-add",
+            ),
+            OperationTestConfig(
                 lambda x: jnp.fft.fft(x),
                 lambda rng: (
                     rng.standard_normal((16,)) + 1j * rng.standard_normal((16,))
