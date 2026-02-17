@@ -580,25 +580,66 @@ static ProcessResult HandleGather(MPSGraph* g, mlir::Operation* op, ValueMap& va
         return Result(values, op, result, "gather");
     }
 
-    // Generic multi-axis gather fallback for index_vector_dim=last, including
-    // patterns used by searchsorted and dslice-based indexing.
+    // Generic gatherND lowering for index_vector_dim=last without batching dims.
+    // Supports multi-axis gathers where non-mapped dimensions are full slices.
     if (indexVectorDim == (int64_t)indicesRank - 1 && operandBatchingDims.empty() &&
-        startIndicesBatchingDims.empty() &&
-        startIndexMap.size() == 1 &&
+        startIndicesBatchingDims.empty() && !startIndexMap.empty() &&
         [indicesShape[indicesRank - 1] integerValue] == (NSInteger)startIndexMap.size()) {
+        auto isMappedDim = [&](NSUInteger dim) {
+            for (int64_t mapDim : startIndexMap) {
+                if ((NSUInteger)mapDim == dim) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        auto isCollapsedDim = [&](NSUInteger dim) {
+            for (int64_t collapsedDim : collapsedSliceDims) {
+                if ((NSUInteger)collapsedDim == dim) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        std::vector<int64_t> sliceDimsInOperandOrder;
+        std::vector<int64_t> nonCollapsedMappedDims;
+        bool gatherNDCompatible = true;
+        for (NSUInteger d = 0; d < operand.shape.count; ++d) {
+            bool mapped = isMappedDim(d);
+            bool collapsed = isCollapsedDim(d);
+            int64_t sliceSize = sliceSizes[d];
+            int64_t operandDim = [operand.shape[d] longLongValue];
+
+            if (mapped) {
+                if (collapsed && sliceSize != 1) {
+                    gatherNDCompatible = false;
+                    break;
+                }
+                if (!collapsed) {
+                    nonCollapsedMappedDims.push_back((int64_t)d);
+                }
+            } else if (operandDim > 0 && sliceSize != operandDim) {
+                gatherNDCompatible = false;
+                break;
+            }
+
+            if (!collapsed) {
+                sliceDimsInOperandOrder.push_back((int64_t)d);
+            }
+        }
+
+        if (!gatherNDCompatible) {
+            return ProcessResult::Error("gather: unsupported gather pattern");
+        }
+
         NSMutableArray<NSNumber*>* perm = [NSMutableArray array];
         for (int64_t d : startIndexMap) {
             [perm addObject:@(d)];
         }
         for (NSUInteger d = 0; d < operand.shape.count; ++d) {
-            bool indexed = false;
-            for (int64_t m : startIndexMap) {
-                if ((NSUInteger)m == d) {
-                    indexed = true;
-                    break;
-                }
-            }
-            if (!indexed) {
+            if (!isMappedDim(d)) {
                 [perm addObject:@(d)];
             }
         }
@@ -616,13 +657,187 @@ static ProcessResult HandleGather(MPSGraph* g, mlir::Operation* op, ValueMap& va
             gatherOperand = [g transposeTensor:operand permutation:perm name:nil];
         }
 
+        NSMutableArray<NSNumber*>* batchShape = [NSMutableArray array];
+        for (NSUInteger i = 0; i + 1 < indicesRank; ++i) {
+            [batchShape addObject:indicesShape[i]];
+        }
+
+        if (startIndexMap.size() == 1) {
+            int64_t gatherAxis = startIndexMap[0];
+            if (sliceSizes[(size_t)gatherAxis] == 1) {
+                MPSGraphTensor* squeezedIndices = [g reshapeTensor:startIndices withShape:batchShape name:nil];
+                squeezedIndices = EnsureInt32(g, squeezedIndices);
+
+                NSUInteger batchDims = 0;
+                while (batchDims < (NSUInteger)gatherAxis && batchDims < operand.shape.count &&
+                       batchDims < batchShape.count &&
+                       [operand.shape[batchDims] integerValue] ==
+                           [batchShape[batchDims] integerValue]) {
+                    batchDims++;
+                }
+
+                MPSGraphTensor* result = [g gatherWithUpdatesTensor:operand
+                                                      indicesTensor:squeezedIndices
+                                                               axis:(NSUInteger)gatherAxis
+                                                    batchDimensions:batchDims
+                                                               name:nil];
+                NSArray<NSNumber*>* outputShape = GetOutputShape(op);
+                if (outputShape && result) {
+                    result = [g reshapeTensor:result withShape:outputShape name:nil];
+                }
+                return Result(values, op, result, "gather");
+            }
+        }
+
         MPSGraphTensor* gatherIndices = EnsureInt32(g, startIndices);
+
+        if (!nonCollapsedMappedDims.empty()) {
+            NSMutableArray<NSNumber*>* expandedIndexPrefixShape = [batchShape mutableCopy];
+            for (int64_t dim : nonCollapsedMappedDims) {
+                [expandedIndexPrefixShape addObject:@(sliceSizes[(size_t)dim])];
+            }
+
+            NSMutableArray<MPSGraphTensor*>* windowOffsets = [NSMutableArray array];
+            for (NSUInteger i = 0; i < nonCollapsedMappedDims.size(); ++i) {
+                MPSGraphTensor* offset = [g coordinateAlongAxis:(NSInteger)(batchShape.count + i)
+                                                      withShape:expandedIndexPrefixShape
+                                                           name:nil];
+                [windowOffsets addObject:EnsureInt32(g, offset)];
+            }
+
+            NSMutableArray<MPSGraphTensor*>* indexComponents = [NSMutableArray array];
+            for (NSUInteger mapPos = 0; mapPos < startIndexMap.size(); ++mapPos) {
+                int64_t dim = startIndexMap[mapPos];
+
+                NSMutableArray<NSNumber*>* starts = [NSMutableArray array];
+                NSMutableArray<NSNumber*>* ends = [NSMutableArray array];
+                NSMutableArray<NSNumber*>* strides = [NSMutableArray array];
+                for (NSUInteger axis = 0; axis < indicesRank; ++axis) {
+                    [strides addObject:@1];
+                    if (axis + 1 == indicesRank) {
+                        [starts addObject:@((NSInteger)mapPos)];
+                        [ends addObject:@((NSInteger)mapPos + 1)];
+                    } else {
+                        [starts addObject:@0];
+                        [ends addObject:indicesShape[axis]];
+                    }
+                }
+
+                MPSGraphTensor* component = [g sliceTensor:startIndices
+                                                    starts:starts
+                                                      ends:ends
+                                                   strides:strides
+                                                      name:nil];
+                component = [g reshapeTensor:component withShape:batchShape name:nil];
+                component = EnsureInt32(g, component);
+
+                NSMutableArray<NSNumber*>* componentShape = [batchShape mutableCopy];
+                for (NSUInteger i = 0; i < nonCollapsedMappedDims.size(); ++i) {
+                    [componentShape addObject:@1];
+                }
+                component = [g reshapeTensor:component withShape:componentShape name:nil];
+                component = [g broadcastTensor:component
+                                       toShape:expandedIndexPrefixShape
+                                          name:nil];
+
+                for (NSUInteger i = 0; i < nonCollapsedMappedDims.size(); ++i) {
+                    if (nonCollapsedMappedDims[i] == dim) {
+                        component = [g additionWithPrimaryTensor:component
+                                                  secondaryTensor:windowOffsets[i]
+                                                             name:nil];
+                        break;
+                    }
+                }
+
+                [indexComponents addObject:component];
+            }
+
+            gatherIndices = [g stackTensors:indexComponents
+                                       axis:(NSInteger)expandedIndexPrefixShape.count
+                                       name:nil];
+            gatherIndices = EnsureInt32(g, gatherIndices);
+        }
+
         MPSGraphTensor* gathered = [g gatherNDWithUpdatesTensor:gatherOperand
                                                   indicesTensor:gatherIndices
                                                 batchDimensions:0
                                                            name:nil];
 
         NSArray<NSNumber*>* outputShape = GetOutputShape(op);
+        auto offsetDims = dimNumbers.getOffsetDims();
+        if (outputShape && gathered) {
+            std::vector<int64_t> currentTags;
+            currentTags.reserve(outputShape.count);
+            for (NSUInteger i = 0; i < batchShape.count; ++i) {
+                currentTags.push_back(-1 - (int64_t)i);
+            }
+            for (int64_t d : nonCollapsedMappedDims) {
+                currentTags.push_back(d);
+            }
+            for (NSUInteger d = 0; d < operand.shape.count; ++d) {
+                if (!isMappedDim(d) && !isCollapsedDim(d)) {
+                    currentTags.push_back((int64_t)d);
+                }
+            }
+
+            std::vector<bool> isOffset(outputShape.count, false);
+            for (int64_t od : offsetDims) {
+                if (od >= 0 && (NSUInteger)od < outputShape.count) {
+                    isOffset[(NSUInteger)od] = true;
+                }
+            }
+
+            std::vector<int64_t> expectedTags;
+            expectedTags.reserve(outputShape.count);
+            size_t batchPos = 0;
+            size_t slicePos = 0;
+            for (NSUInteger i = 0; i < outputShape.count; ++i) {
+                if (isOffset[i]) {
+                    if (slicePos >= sliceDimsInOperandOrder.size()) {
+                        expectedTags.clear();
+                        break;
+                    }
+                    expectedTags.push_back(sliceDimsInOperandOrder[slicePos++]);
+                } else {
+                    expectedTags.push_back(-1 - (int64_t)batchPos++);
+                }
+            }
+
+            if (!expectedTags.empty() && expectedTags.size() == currentTags.size()) {
+                std::vector<bool> used(currentTags.size(), false);
+                NSMutableArray<NSNumber*>* outPerm = [NSMutableArray arrayWithCapacity:expectedTags.size()];
+                bool permValid = true;
+                for (int64_t tag : expectedTags) {
+                    bool found = false;
+                    for (NSUInteger j = 0; j < currentTags.size(); ++j) {
+                        if (!used[j] && currentTags[j] == tag) {
+                            used[j] = true;
+                            [outPerm addObject:@((NSInteger)j)];
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        permValid = false;
+                        break;
+                    }
+                }
+
+                if (permValid) {
+                    bool isIdentity = true;
+                    for (NSUInteger i = 0; i < outPerm.count; ++i) {
+                        if ([outPerm[i] integerValue] != (NSInteger)i) {
+                            isIdentity = false;
+                            break;
+                        }
+                    }
+                    if (!isIdentity) {
+                        gathered = [g transposeTensor:gathered permutation:outPerm name:nil];
+                    }
+                }
+            }
+        }
+
         if (outputShape && gathered) {
             gathered = [g reshapeTensor:gathered withShape:outputShape name:nil];
         }
