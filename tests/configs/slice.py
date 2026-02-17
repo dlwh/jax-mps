@@ -61,6 +61,22 @@ def make_slice_op_configs():
                 name="advanced_gather-new-axis",
             ),
             OperationTestConfig(
+                lambda x: x[
+                    jnp.broadcast_to(jnp.arange(5, dtype=jnp.int32)[:, None], (5, 7)),
+                    :,
+                    jnp.broadcast_to(jnp.arange(3, 10, dtype=jnp.int32)[None, :], (5, 7)),
+                ],
+                numpy.random.normal(size=(10, 20, 30)).astype(numpy.float32),
+                differentiable_argnums=(),
+                name="advanced_gather-two-axis-slice-middle",
+            ),
+            OperationTestConfig(
+                lambda x: x[jnp.arange(1, 6, dtype=jnp.int32), :, 3:7],
+                numpy.random.normal(size=(10, 20, 30)).astype(numpy.float32),
+                differentiable_argnums=(),
+                name="advanced_gather-index-and-window-slice",
+            ),
+            OperationTestConfig(
                 lambda x, idx: jnp.take_along_axis(x, idx, axis=2),
                 numpy.random.normal(size=(2, 3, 4, 5)).astype(numpy.float32),
                 numpy.random.randint(0, 4, size=(2, 3, 6, 5), dtype=numpy.int32),
