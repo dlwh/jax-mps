@@ -580,6 +580,55 @@ static ProcessResult HandleGather(MPSGraph* g, mlir::Operation* op, ValueMap& va
         return Result(values, op, result, "gather");
     }
 
+    // Generic multi-axis gather fallback for index_vector_dim=last, including
+    // patterns used by searchsorted and dslice-based indexing.
+    if (indexVectorDim == (int64_t)indicesRank - 1 && operandBatchingDims.empty() &&
+        startIndicesBatchingDims.empty() &&
+        startIndexMap.size() == 1 &&
+        [indicesShape[indicesRank - 1] integerValue] == (NSInteger)startIndexMap.size()) {
+        NSMutableArray<NSNumber*>* perm = [NSMutableArray array];
+        for (int64_t d : startIndexMap) {
+            [perm addObject:@(d)];
+        }
+        for (NSUInteger d = 0; d < operand.shape.count; ++d) {
+            bool indexed = false;
+            for (int64_t m : startIndexMap) {
+                if ((NSUInteger)m == d) {
+                    indexed = true;
+                    break;
+                }
+            }
+            if (!indexed) {
+                [perm addObject:@(d)];
+            }
+        }
+
+        bool identityPerm = true;
+        for (NSUInteger i = 0; i < perm.count; ++i) {
+            if ([perm[i] integerValue] != (NSInteger)i) {
+                identityPerm = false;
+                break;
+            }
+        }
+
+        MPSGraphTensor* gatherOperand = operand;
+        if (!identityPerm) {
+            gatherOperand = [g transposeTensor:operand permutation:perm name:nil];
+        }
+
+        MPSGraphTensor* gatherIndices = EnsureInt32(g, startIndices);
+        MPSGraphTensor* gathered = [g gatherNDWithUpdatesTensor:gatherOperand
+                                                  indicesTensor:gatherIndices
+                                                batchDimensions:0
+                                                           name:nil];
+
+        NSArray<NSNumber*>* outputShape = GetOutputShape(op);
+        if (outputShape && gathered) {
+            gathered = [g reshapeTensor:gathered withShape:outputShape name:nil];
+        }
+        return Result(values, op, gathered, "gather");
+    }
+
     // For now, log unsupported patterns
     return ProcessResult::Error("gather: unsupported gather pattern");
 }
